@@ -50,6 +50,14 @@ if not hasattr(_canvas_st_image, "image_to_url"):
 
     _canvas_st_image.image_to_url = _image_to_url_compat
 
+
+def _rerun_app() -> None:
+    rerun = getattr(st, "rerun", None)
+    if rerun is not None:
+        rerun()
+    else:  # pragma: no cover - fallback for older Streamlit releases
+        st.experimental_rerun()
+
 # ---------- Utility conversions ----------
 
 def _load_image(file) -> Image.Image:
@@ -620,7 +628,7 @@ def main():
 
         if st.session_state.get("needs_canvas_refresh"):
             st.session_state["needs_canvas_refresh"] = False
-            st.experimental_rerun()
+            _rerun_app()
 
         st.write(
             "Use the toolbar to select, move, or delete shapes. Switch drawing modes to add new rooms or fixtures."
@@ -645,7 +653,7 @@ def main():
                 active_room["status"] = status
                 active_room["color"] = color
                 active_room["notes"] = notes
-                st.experimental_rerun()
+                _rerun_app()
 
             st.markdown("**Summary**")
             st.write(_room_summary(active_room))
