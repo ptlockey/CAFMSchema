@@ -19,7 +19,8 @@ class Marker:
 
 # ---------------- State init ----------------
 def init_state():
-    st.session_state.setdefault("image", None)            # PIL image
+    st.session_state.setdefault("image", None)            # Display image with markers
+    st.session_state.setdefault("base_image", None)       # Original PIL image
     st.session_state.setdefault("image_b64", None)        # data uri or raw b64
     st.session_state.setdefault("mime", "image/png")
     st.session_state.setdefault("markers", [])            # list[Marker]
@@ -27,7 +28,7 @@ def init_state():
     st.session_state.setdefault("pan_x", 0.0)
     st.session_state.setdefault("pan_y", 0.0)
     st.session_state.setdefault("tool_choice", "None")
-    st.session_state.setdefault("last_event_token", None)
+    st.session_state.setdefault("last_click", None)
 
 init_state()
 
@@ -88,16 +89,10 @@ def draw_markers(base: Image.Image, markers: List[Marker]) -> Image.Image:
         draw.text((x + r + 2, y - r - 2), label, fill=(0, 0, 0, 255))
     return img
 
-def trigger_rerun() -> None:
-    """Trigger a Streamlit rerun using the available API."""
-    rerun_fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
-    if rerun_fn is None:
-        raise RuntimeError("Streamlit does not support rerun in this version.")
-    rerun_fn()
-
 def export_json() -> bytes:
     # Build a compact export with embedded base64 and markers
-    data_uri = st.session_state.image_b64 or encode_image_to_data_uri(st.session_state.image, st.session_state.mime)
+    base_img = st.session_state.base_image or st.session_state.image
+    data_uri = st.session_state.image_b64 or encode_image_to_data_uri(base_img, st.session_state.mime)
     export = {
         "pages": {
             "0": {
@@ -127,6 +122,7 @@ if choice == "JSON (with base64 image)":
             if img is None:
                 st.sidebar.error("JSON did not include a valid base64-encoded image.")
             else:
+                st.session_state.base_image = img
                 st.session_state.image = img
                 st.session_state.mime = mime or "image/png"
                 # Load any markers if present
@@ -134,15 +130,16 @@ if choice == "JSON (with base64 image)":
                 mlist = node.get("markers") or []
                 st.session_state.markers = [Marker(**m) for m in mlist if isinstance(m, dict) and "kind" in m and "x" in m and "y" in m]
                 st.session_state.image_b64 = node.get("image_b64") or node.get("image_base64") or node.get("image")
-                st.session_state.last_event_token = None
+                st.session_state.last_click = None
 
 else:
     f = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg"])
     if f is not None:
-        st.session_state.image = Image.open(f).convert("RGBA")
+        st.session_state.base_image = Image.open(f).convert("RGBA")
+        st.session_state.image = st.session_state.base_image
         st.session_state.mime = "image/png"
         st.session_state.image_b64 = None  # regenerate on export
-        st.session_state.last_event_token = None
+        st.session_state.last_click = None
 
 # Marker tools
 st.sidebar.header("Tools")
@@ -157,7 +154,7 @@ clear = st.sidebar.button("Clear markers")
 
 if clear:
     st.session_state.markers = []
-    st.session_state.last_event_token = None
+    st.session_state.last_click = None
 
 # View controls
 st.sidebar.header("View controls")
@@ -191,70 +188,30 @@ else:
     st.sidebar.caption("Zoom in to enable pan controls.")
 
 # ---------------- Main canvas ----------------
-if st.session_state.image is None:
+base_image = st.session_state.base_image or st.session_state.image
+
+if base_image is None:
     st.info("Upload a schematic (JSON with base64 image, or a PNG/JPG).")
     st.stop()
 
-img = draw_markers(st.session_state.image, st.session_state.markers)
+display_img = draw_markers(base_image, st.session_state.markers)
+st.session_state.image = display_img
 
-st.write("Click on the image to add markers. Use the zoom and pan controls in the sidebar to inspect the schematic.")
+st.write("Click on the image to add markers.")
 
-# Prepare zoomed / panned view
-W, H = img.size
-scale = max(1.0, float(st.session_state.scale))
-view_w = max(1, int(round(W / scale)))
-view_h = max(1, int(round(H / scale)))
-max_left = max(0, W - view_w)
-max_top = max(0, H - view_h)
-left = int(round(st.session_state.pan_x * max_left))
-top = int(round(st.session_state.pan_y * max_top))
-box = (left, top, left + view_w, top + view_h)
-crop = img.crop(box)
-display_w = max(1, int(round(view_w * scale)))
-display_h = max(1, int(round(view_h * scale)))
-display_img = crop.resize((display_w, display_h), Image.BICUBIC)
-
-if display_img.mode != "RGB":
-    display_img_for_streamlit = display_img.convert("RGB")
-else:
-    display_img_for_streamlit = display_img
-
-render_width = min(1200, display_w)
 res = streamlit_image_coordinates(
-    display_img_for_streamlit, key="img_click", width=render_width
+    st.session_state.image, key="img_click", width=min(1200, st.session_state.image.width)
 )
 
 if res and tool in ("Tap", "Shower"):
-    # Protect against incomplete coordinate payloads that can occur during reruns
-    x = res.get("x")
-    y = res.get("y")
-    width = res.get("width") or render_width
-    height = res.get("height") or display_h
-    if None not in (x, y) and width and height:
-        # Use the event's unix timestamp when available so we only handle a click once
-        event_token: object
-        if "unix_time" in res:
-            event_token = res["unix_time"]
-        else:
-            event_token = (x, y, width, height, tool)
-        if st.session_state.last_event_token == event_token:
-            # We've already processed this interaction on a previous rerun.
-            pass
-        else:
-            st.session_state.last_event_token = event_token
-            # Convert absolute pixel to relative
-            scale_factor = width / display_w if display_w else 1.0
-            x_disp = x / scale_factor if scale_factor else x
-            y_disp = y / scale_factor if scale_factor else y
-            x_crop = x_disp * (view_w / display_w)
-            y_crop = y_disp * (view_h / display_h)
-            x_abs = left + x_crop
-            y_abs = top + y_crop
-            x_rel = min(1.0, max(0.0, x_abs / W))
-            y_rel = min(1.0, max(0.0, y_abs / H))
-            kind = "tap" if tool == "Tap" else "shower"
-            st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
-            trigger_rerun()
+    W, H = st.session_state.image.size
+    x_rel = res["x"] / W
+    y_rel = res["y"] / H
+    kind = "tap" if tool == "Tap" else "shower"
+    # Append only if coordinates actually changed
+    if not st.session_state.get("last_click") == (x_rel, y_rel, kind):
+        st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
+        st.session_state.last_click = (x_rel, y_rel, kind)
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
