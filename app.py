@@ -182,14 +182,24 @@ def _render_viewer(image: Image.Image, zoom: float, active_tool: str) -> None:
     )
 
     if result:
+        x = result.get("x")
+        y = result.get("y")
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+
         # Avoid recording duplicate clicks after reruns
         if result != st.session_state.last_click:
-            st.session_state.last_click = result
             if result.get("width") and result.get("height"):
                 display_width = result["width"]
                 display_height = result["height"]
-            x_norm = result["x"] / display_width if display_width else 0
-            y_norm = result["y"] / display_height if display_height else 0
+
+            if display_width <= 0 or display_height <= 0:
+                return
+
+            x_norm = max(0.0, min(1.0, x / display_width))
+            y_norm = max(0.0, min(1.0, y / display_height))
+
+            st.session_state.last_click = dict(result)
             st.session_state.markers.append(
                 Marker(kind=active_tool, x=x_norm, y=y_norm)
             )
