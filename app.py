@@ -26,6 +26,7 @@ def init_state():
     st.session_state.setdefault("scale", 1.0)
     st.session_state.setdefault("pan_x", 0.0)
     st.session_state.setdefault("pan_y", 0.0)
+    st.session_state.setdefault("tool_choice", "None")
 
 init_state()
 
@@ -135,7 +136,13 @@ else:
 
 # Marker tools
 st.sidebar.header("Tools")
-tool = st.sidebar.radio("Add marker", ["Tap","Shower","None"], index=2, horizontal=True)
+tool_options = ["Tap", "Shower", "None"]
+tool = st.sidebar.radio(
+    "Add marker",
+    tool_options,
+    key="tool_choice",
+    horizontal=True,
+)
 clear = st.sidebar.button("Clear markers")
 
 if clear:
@@ -196,8 +203,15 @@ display_w = max(1, int(round(view_w * scale)))
 display_h = max(1, int(round(view_h * scale)))
 display_img = crop.resize((display_w, display_h), Image.BICUBIC)
 
+if display_img.mode != "RGB":
+    display_img_for_streamlit = display_img.convert("RGB")
+else:
+    display_img_for_streamlit = display_img
+
 render_width = min(1200, display_w)
-res = streamlit_image_coordinates(display_img, key="img_click", width=render_width)
+res = streamlit_image_coordinates(
+    display_img_for_streamlit, key="img_click", width=render_width
+)
 
 if res and tool in ("Tap","Shower"):
     # Convert absolute pixel to relative
@@ -212,6 +226,7 @@ if res and tool in ("Tap","Shower"):
     y_rel = min(1.0, max(0.0, y_abs / H))
     kind = "tap" if tool == "Tap" else "shower"
     st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
+    st.experimental_rerun()
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
