@@ -199,6 +199,7 @@ def _ensure_floor(name: str, image: Image.Image) -> str:
         "rooms": {},
     }
     st.session_state["active_floor"] = name
+    st.session_state["needs_canvas_refresh"] = True
     return name
 
 
@@ -273,6 +274,8 @@ def _ingest_layout_json(payload: bytes, source_name: str) -> None:
             floor["rooms"] = keyed_rooms
         else:
             floor["rooms"] = {}
+
+        st.session_state["needs_canvas_refresh"] = True
 
 
 def _get_floor_image(floor_key: str) -> Image.Image:
@@ -561,6 +564,8 @@ def main():
 
     floor = st.session_state["floors"][active_floor]
     floor_image = _get_floor_image(active_floor)
+    if floor_image.mode != "RGBA":
+        floor_image = floor_image.convert("RGBA")
     width, height = floor_image.size
 
     col_canvas, col_info = st.columns([3, 2])
@@ -600,7 +605,7 @@ def main():
             drawing_mode=drawing_mode,
             initial_drawing=canvas_json,
             display_toolbar=True,
-            key="schematic_canvas",
+            key=f"schematic_canvas_{active_floor}",
         )
 
         if canvas_result.json_data:
