@@ -10,6 +10,24 @@ import streamlit as st
 from streamlit_drawable_canvas import st_canvas, st_image as _canvas_st_image
 
 
+def _init_session_state() -> None:
+    if "floors" not in st.session_state:
+        st.session_state["floors"] = {}
+    if "active_floor" not in st.session_state:
+        st.session_state["active_floor"] = None
+    if "active_room_id" not in st.session_state:
+        st.session_state["active_room_id"] = None
+    if "drawing_entity" not in st.session_state:
+        st.session_state["drawing_entity"] = "Room"
+    if "needs_canvas_refresh" not in st.session_state:
+        st.session_state["needs_canvas_refresh"] = False
+    if "processed_uploads" not in st.session_state:
+        st.session_state["processed_uploads"] = set()
+
+
+_init_session_state()
+
+
 # streamlit-drawable-canvas expects the deprecated ``st_image.image_to_url`` helper.
 # Streamlit 1.41+ moved that functionality to ``streamlit.elements.lib.image_utils``.
 # Provide a small compatibility shim so the component can keep working on
@@ -31,23 +49,6 @@ if not hasattr(_canvas_st_image, "image_to_url"):
         )
 
     _canvas_st_image.image_to_url = _image_to_url_compat
-
-# ---------- Session helpers ----------
-
-def _init_session_state() -> None:
-    if "floors" not in st.session_state:
-        st.session_state["floors"] = {}
-    if "active_floor" not in st.session_state:
-        st.session_state["active_floor"] = None
-    if "active_room_id" not in st.session_state:
-        st.session_state["active_room_id"] = None
-    if "drawing_entity" not in st.session_state:
-        st.session_state["drawing_entity"] = "Room"
-    if "needs_canvas_refresh" not in st.session_state:
-        st.session_state["needs_canvas_refresh"] = False
-    if "processed_uploads" not in st.session_state:
-        st.session_state["processed_uploads"] = set()
-
 
 # ---------- Utility conversions ----------
 
@@ -484,7 +485,6 @@ def _crop_room_preview(image: Image.Image, room: Dict) -> Optional[Image.Image]:
 
 def main():
     st.set_page_config(page_title="Building Schematic Mapper", layout="wide")
-    _init_session_state()
 
     st.title("Building Schematic Mapper")
     st.caption(
@@ -522,7 +522,7 @@ def main():
             st.session_state["active_floor"] = active_floor
         else:
             st.info("Upload at least one floor image to begin.")
-            return
+            st.stop()
 
         search = st.text_input("Filter rooms", "")
 
@@ -550,7 +550,15 @@ def main():
         ).encode("utf-8")
         st.download_button("Download layout JSON", export_payload, file_name="schematic.json")
 
-    active_floor = st.session_state["active_floor"]
+    active_floor = st.session_state.get("active_floor")
+    if not active_floor:
+        st.warning("Select a floor to begin editing.")
+        st.stop()
+
+    if active_floor not in st.session_state["floors"]:
+        st.warning("The selected floor is no longer available. Please choose another upload.")
+        st.stop()
+
     floor = st.session_state["floors"][active_floor]
     floor_image = _get_floor_image(active_floor)
     width, height = floor_image.size
@@ -592,7 +600,7 @@ def main():
             drawing_mode=drawing_mode,
             initial_drawing=canvas_json,
             display_toolbar=True,
-            key=f"canvas_{active_floor}"
+            key="schematic_canvas",
         )
 
         if canvas_result.json_data:
