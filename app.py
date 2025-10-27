@@ -45,6 +45,8 @@ def _init_session_state() -> None:
         st.session_state["drawing_entity"] = "Room"
     if "needs_canvas_refresh" not in st.session_state:
         st.session_state["needs_canvas_refresh"] = False
+    if "processed_uploads" not in st.session_state:
+        st.session_state["processed_uploads"] = set()
 
 
 # ---------- Utility conversions ----------
@@ -54,6 +56,10 @@ def _load_image(file) -> Image.Image:
     if image.mode != "RGBA":
         image = image.convert("RGBA")
     return image
+
+
+def _load_image_bytes(data: bytes) -> Image.Image:
+    return _load_image(io.BytesIO(data))
 
 
 def _image_to_bytes(image: Image.Image) -> bytes:
@@ -193,6 +199,79 @@ def _ensure_floor(name: str, image: Image.Image) -> str:
     }
     st.session_state["active_floor"] = name
     return name
+
+
+def _register_uploaded_file(file) -> bool:
+    """Return True if this upload hasn't been processed yet."""
+
+    identifier = getattr(file, "file_id", None)
+    if identifier is None:
+        size = getattr(file, "size", None)
+        identifier = f"{file.name}:{size}"
+
+    processed = st.session_state.setdefault("processed_uploads", set())
+    if identifier in processed:
+        return False
+
+    processed.add(identifier)
+    return True
+
+
+def _ingest_layout_json(payload: bytes, source_name: str) -> None:
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        st.error(f"Could not parse JSON layout from {source_name}.")
+        return
+
+    floors_data: List[Dict]
+    if isinstance(data, list):
+        floors_data = data
+    elif isinstance(data, dict):
+        floors_data = data.get("floors", [])  # type: ignore[assignment]
+        if not isinstance(floors_data, list):
+            st.error(f"JSON layout in {source_name} is not formatted correctly.")
+            return
+    else:
+        st.error(f"JSON layout in {source_name} is not formatted correctly.")
+        return
+
+    if not floors_data:
+        st.warning(f"No floors found in {source_name}.")
+        return
+
+    for index, entry in enumerate(floors_data):
+        if not isinstance(entry, dict):
+            continue
+        floor_name = entry.get("floor") or f"Imported floor {index + 1}"
+        image_b64 = entry.get("image_bytes_b64")
+        if not image_b64:
+            st.warning(f"Skipping floor '{floor_name}' – missing schematic image data.")
+            continue
+        try:
+            image_bytes = base64.b64decode(image_b64)
+        except (base64.binascii.Error, TypeError):
+            st.warning(f"Skipping floor '{floor_name}' – schematic image data is invalid.")
+            continue
+
+        image = _load_image_bytes(image_bytes)
+        floor_key = _ensure_floor(floor_name, image)
+        floor = st.session_state["floors"][floor_key]
+
+        rooms = entry.get("rooms", [])
+        if isinstance(rooms, list):
+            keyed_rooms: Dict[str, Dict] = {}
+            for room in rooms:
+                if not isinstance(room, dict):
+                    continue
+                room_id = room.get("id")
+                if not room_id:
+                    continue
+                room.setdefault("fixtures", [])
+                keyed_rooms[room_id] = room
+            floor["rooms"] = keyed_rooms
+        else:
+            floor["rooms"] = {}
 
 
 def _get_floor_image(floor_key: str) -> Image.Image:
@@ -415,14 +494,22 @@ def main():
     with st.sidebar:
         st.header("Floors & Rooms")
         uploaded_files = st.file_uploader(
-            "Upload PNG/JPG schematics",
-            type=["png", "jpg", "jpeg"],
+            "Upload schematics (PNG/JPG) or layout JSON",
+            type=["png", "jpg", "jpeg", "json"],
             accept_multiple_files=True,
         )
         if uploaded_files:
             for file in uploaded_files:
-                image = _load_image(file)
-                _ensure_floor(file.name, image)
+                if not _register_uploaded_file(file):
+                    continue
+
+                file_name = file.name
+                if file_name.lower().endswith(".json"):
+                    payload = file.read()
+                    _ingest_layout_json(payload, file_name)
+                else:
+                    image = _load_image(file)
+                    _ensure_floor(file.name, image)
 
         floors = st.session_state["floors"]
         if floors:
