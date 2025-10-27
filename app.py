@@ -27,6 +27,7 @@ def init_state():
     st.session_state.setdefault("pan_x", 0.0)
     st.session_state.setdefault("pan_y", 0.0)
     st.session_state.setdefault("tool_choice", "None")
+    st.session_state.setdefault("last_event_token", None)
 
 init_state()
 
@@ -133,6 +134,7 @@ if choice == "JSON (with base64 image)":
                 mlist = node.get("markers") or []
                 st.session_state.markers = [Marker(**m) for m in mlist if isinstance(m, dict) and "kind" in m and "x" in m and "y" in m]
                 st.session_state.image_b64 = node.get("image_b64") or node.get("image_base64") or node.get("image")
+                st.session_state.last_event_token = None
 
 else:
     f = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg"])
@@ -140,6 +142,7 @@ else:
         st.session_state.image = Image.open(f).convert("RGBA")
         st.session_state.mime = "image/png"
         st.session_state.image_b64 = None  # regenerate on export
+        st.session_state.last_event_token = None
 
 # Marker tools
 st.sidebar.header("Tools")
@@ -154,6 +157,7 @@ clear = st.sidebar.button("Clear markers")
 
 if clear:
     st.session_state.markers = []
+    st.session_state.last_event_token = None
 
 # View controls
 st.sidebar.header("View controls")
@@ -227,19 +231,30 @@ if res and tool in ("Tap", "Shower"):
     width = res.get("width") or render_width
     height = res.get("height") or display_h
     if None not in (x, y) and width and height:
-        # Convert absolute pixel to relative
-        scale_factor = width / display_w if display_w else 1.0
-        x_disp = x / scale_factor if scale_factor else x
-        y_disp = y / scale_factor if scale_factor else y
-        x_crop = x_disp * (view_w / display_w)
-        y_crop = y_disp * (view_h / display_h)
-        x_abs = left + x_crop
-        y_abs = top + y_crop
-        x_rel = min(1.0, max(0.0, x_abs / W))
-        y_rel = min(1.0, max(0.0, y_abs / H))
-        kind = "tap" if tool == "Tap" else "shower"
-        st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
-        trigger_rerun()
+        # Use the event's unix timestamp when available so we only handle a click once
+        event_token: object
+        if "unix_time" in res:
+            event_token = res["unix_time"]
+        else:
+            event_token = (x, y, width, height, tool)
+        if st.session_state.last_event_token == event_token:
+            # We've already processed this interaction on a previous rerun.
+            pass
+        else:
+            st.session_state.last_event_token = event_token
+            # Convert absolute pixel to relative
+            scale_factor = width / display_w if display_w else 1.0
+            x_disp = x / scale_factor if scale_factor else x
+            y_disp = y / scale_factor if scale_factor else y
+            x_crop = x_disp * (view_w / display_w)
+            y_crop = y_disp * (view_h / display_h)
+            x_abs = left + x_crop
+            y_abs = top + y_crop
+            x_rel = min(1.0, max(0.0, x_abs / W))
+            y_rel = min(1.0, max(0.0, y_abs / H))
+            kind = "tap" if tool == "Tap" else "shower"
+            st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
+            trigger_rerun()
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
