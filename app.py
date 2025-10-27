@@ -87,6 +87,13 @@ def draw_markers(base: Image.Image, markers: List[Marker]) -> Image.Image:
         draw.text((x + r + 2, y - r - 2), label, fill=(0, 0, 0, 255))
     return img
 
+def trigger_rerun() -> None:
+    """Trigger a Streamlit rerun using the available API."""
+    rerun_fn = getattr(st, "rerun", None) or getattr(st, "experimental_rerun", None)
+    if rerun_fn is None:
+        raise RuntimeError("Streamlit does not support rerun in this version.")
+    rerun_fn()
+
 def export_json() -> bytes:
     # Build a compact export with embedded base64 and markers
     data_uri = st.session_state.image_b64 or encode_image_to_data_uri(st.session_state.image, st.session_state.mime)
@@ -226,7 +233,7 @@ if res and tool in ("Tap","Shower"):
     y_rel = min(1.0, max(0.0, y_abs / H))
     kind = "tap" if tool == "Tap" else "shower"
     st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
-    st.experimental_rerun()
+    trigger_rerun()
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
