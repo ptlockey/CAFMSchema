@@ -58,8 +58,16 @@ def _decode_image_from_json(data: Dict) -> Optional[Image.Image]:
         except IndexError:
             return None
 
+    if isinstance(image_entry, str):
+        normalised = "".join(image_entry.split())
+        padding = len(normalised) % 4
+        if padding:
+            normalised += "=" * (4 - padding)
+    else:
+        normalised = image_entry
+
     try:
-        image_bytes = base64.b64decode(image_entry)
+        image_bytes = base64.b64decode(normalised)
     except (base64.binascii.Error, TypeError, ValueError):
         return None
 
