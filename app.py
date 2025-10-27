@@ -1,7 +1,6 @@
 import base64
 import io
 import json
-import math
 import uuid
 from typing import Dict, List, Optional, Tuple
 
@@ -178,22 +177,6 @@ def _room_to_object(room: Dict, width: float, height: float, is_selected: bool) 
     }
 
 
-def _direction_line_object(start: Tuple[float, float], end: Tuple[float, float], width: float, height: float) -> Dict:
-    sx, sy = _denormalize_point(*start, width, height)
-    ex, ey = _denormalize_point(*end, width, height)
-    return {
-        "type": "path",
-        "path": [["M", sx, sy], ["L", ex, ey]],
-        "stroke": "#ff6600",
-        "strokeWidth": 3,
-        "fill": None,
-        "opacity": 0.9,
-        "data": {"entity": "direction"},
-        "selectable": False,
-        "evented": False,
-    }
-
-
 # ---------- Floor data helpers ----------
 
 def _ensure_floor(name: str, image: Image.Image) -> str:
@@ -207,8 +190,6 @@ def _ensure_floor(name: str, image: Image.Image) -> str:
         "image_bytes": _image_to_bytes(image),
         "image_size": image.size,
         "rooms": {},
-        "current_location": None,
-        "destination": None,
     }
     st.session_state["active_floor"] = name
     return name
@@ -253,39 +234,6 @@ def _build_canvas_objects(floor_key: str) -> List[Dict]:
                 )
             )
 
-    if floor.get("current_location"):
-        objects.append(
-            _circle_object(
-                floor["current_location"][0],
-                floor["current_location"][1],
-                width,
-                height,
-                "#32cd32",
-                radius=10,
-                data={"entity": "pin", "pin_type": "current"},
-            )
-        )
-    if floor.get("destination"):
-        objects.append(
-            _circle_object(
-                floor["destination"][0],
-                floor["destination"][1],
-                width,
-                height,
-                "#ff0000",
-                radius=10,
-                data={"entity": "pin", "pin_type": "destination"},
-            )
-        )
-    if floor.get("current_location") and floor.get("destination"):
-        objects.append(
-            _direction_line_object(
-                floor["current_location"],
-                floor["destination"],
-                width,
-                height,
-            )
-        )
     return objects
 
 
@@ -360,18 +308,6 @@ def _capture_new_objects(floor_key: str, new_objects: List[Dict]) -> None:
             created = created or fixture_id is not None
         if created:
             st.session_state["needs_canvas_refresh"] = True
-    elif entity in {"Current Pin", "Destination Pin"}:
-        floor = st.session_state["floors"][floor_key]
-        width, height = floor["image_size"]
-        for obj in new_objects:
-            if obj.get("type") != "circle":
-                continue
-            point = _point_from_circle(obj, width, height)
-            if entity == "Current Pin":
-                floor["current_location"] = point
-            else:
-                floor["destination"] = point
-            st.session_state["needs_canvas_refresh"] = True
 
 
 def _sync_existing_entities(floor_key: str, objects: List[Dict]) -> None:
@@ -380,9 +316,6 @@ def _sync_existing_entities(floor_key: str, objects: List[Dict]) -> None:
 
     seen_rooms = set()
     seen_fixtures = set()
-    has_current = False
-    has_destination = False
-
     for obj in objects:
         data = obj.get("data", {})
         entity = data.get("entity")
@@ -407,15 +340,6 @@ def _sync_existing_entities(floor_key: str, objects: List[Dict]) -> None:
                     fixture["point"] = point
                     seen_fixtures.add(fixture_id)
                     break
-        elif entity == "pin":
-            pin_type = data.get("pin_type")
-            point = _point_from_circle(obj, width, height)
-            if pin_type == "current":
-                floor["current_location"] = point
-                has_current = True
-            elif pin_type == "destination":
-                floor["destination"] = point
-                has_destination = True
 
     # Remove entities that were deleted on the canvas
     for room_id in list(floor["rooms"].keys()):
@@ -427,10 +351,6 @@ def _sync_existing_entities(floor_key: str, objects: List[Dict]) -> None:
     for room in floor["rooms"].values():
         room["fixtures"] = [fixture for fixture in room.get("fixtures", []) if fixture["id"] in seen_fixtures]
 
-    if not has_current:
-        floor["current_location"] = None
-    if not has_destination:
-        floor["destination"] = None
 
 
 def _detect_active_room(objects: List[Dict]) -> Optional[str]:
@@ -457,31 +377,7 @@ def _floor_to_jsonable(floor_key: str) -> Dict:
         "floor": floor_key,
         "image_bytes_b64": base64.b64encode(floor["image_bytes"]).decode("utf-8"),
         "rooms": list(floor["rooms"].values()),
-        "current_location": floor.get("current_location"),
-        "destination": floor.get("destination"),
     }
-
-
-def _direction_steps(floor_key: str) -> List[str]:
-    floor = st.session_state["floors"][floor_key]
-    if not (floor.get("current_location") and floor.get("destination")):
-        return []
-    width, height = floor["image_size"]
-    start = floor["current_location"]
-    end = floor["destination"]
-    dx = end[0] - start[0]
-    dy = end[1] - start[1]
-
-    distance_pixels = math.sqrt((dx * width) ** 2 + (dy * height) ** 2)
-    steps: List[str] = []
-    if dx != 0:
-        direction = "right" if dx > 0 else "left"
-        steps.append(f"Move {direction} approximately {abs(dx) * 100:.1f}% of the floor width.")
-    if dy != 0:
-        direction = "down" if dy > 0 else "up"
-        steps.append(f"Move {direction} approximately {abs(dy) * 100:.1f}% of the floor height.")
-    steps.append(f"Estimated straight-line distance: {distance_pixels:.1f} pixels.")
-    return steps
 
 
 def _crop_room_preview(image: Image.Image, room: Dict) -> Optional[Image.Image]:
@@ -576,12 +472,14 @@ def main():
 
     with col_canvas:
         st.subheader("Interactive map")
+        drawing_modes = ["Room", "Tap", "Shower", "Move/Select"]
+        default_mode = st.session_state.get("drawing_entity", "Room")
+        if default_mode not in drawing_modes:
+            default_mode = "Room"
         drawing_entity = st.radio(
             "Drawing mode",
-            ["Room", "Tap", "Shower", "Current Pin", "Destination Pin", "Move/Select"],
-            index=["Room", "Tap", "Shower", "Current Pin", "Destination Pin", "Move/Select"].index(
-                st.session_state.get("drawing_entity", "Room")
-            ),
+            drawing_modes,
+            index=drawing_modes.index(default_mode),
             horizontal=True,
         )
         st.session_state["drawing_entity"] = drawing_entity
@@ -625,7 +523,7 @@ def main():
             st.experimental_rerun()
 
         st.write(
-            "Use the toolbar to select, move, or delete shapes. Switch drawing modes to add new rooms, fixtures, or pins."
+            "Use the toolbar to select, move, or delete shapes. Switch drawing modes to add new rooms or fixtures."
         )
 
     with col_info:
@@ -662,14 +560,6 @@ def main():
                     st.write(f"• {fixture['type'].title()} at {fixture['point']}")
         else:
             st.info("Select a room to edit its details.")
-
-        st.subheader("Directions")
-        steps = _direction_steps(active_floor)
-        if steps:
-            for step in steps:
-                st.write(f"- {step}")
-        else:
-            st.write("Place both a current-location pin and a destination pin to view directions.")
 
     st.subheader("Data overview")
     for room in floor["rooms"].values():
