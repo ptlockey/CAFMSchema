@@ -8,7 +8,30 @@ from typing import Dict, List, Optional, Tuple
 from PIL import Image
 from shapely.geometry import Point, Polygon
 import streamlit as st
-from streamlit_drawable_canvas import st_canvas
+from streamlit_drawable_canvas import st_canvas, st_image as _canvas_st_image
+
+
+# streamlit-drawable-canvas expects the deprecated ``st_image.image_to_url`` helper.
+# Streamlit 1.41+ moved that functionality to ``streamlit.elements.lib.image_utils``.
+# Provide a small compatibility shim so the component can keep working on
+# modern Streamlit versions without crashing at import time.
+if not hasattr(_canvas_st_image, "image_to_url"):
+    from streamlit.elements.lib import image_utils as _image_utils
+    from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+
+    def _image_to_url_compat(image, width, clamp, channels, output_format, image_id):
+        width_value = width if width is not None else "content"
+        layout_config = _LayoutConfig(width=width_value)
+        return _image_utils.image_to_url(
+            image,
+            layout_config=layout_config,
+            clamp=clamp,
+            channels=channels,
+            output_format=output_format,
+            image_id=image_id,
+        )
+
+    _canvas_st_image.image_to_url = _image_to_url_compat
 
 # ---------- Session helpers ----------
 
