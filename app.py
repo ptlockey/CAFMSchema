@@ -220,20 +220,26 @@ res = streamlit_image_coordinates(
     display_img_for_streamlit, key="img_click", width=render_width
 )
 
-if res and tool in ("Tap","Shower"):
-    # Convert absolute pixel to relative
-    scale_factor = render_width / display_w if display_w else 1.0
-    x_disp = res["x"] / scale_factor if scale_factor else res["x"]
-    y_disp = res["y"] / scale_factor if scale_factor else res["y"]
-    x_crop = x_disp * (view_w / display_w)
-    y_crop = y_disp * (view_h / display_h)
-    x_abs = left + x_crop
-    y_abs = top + y_crop
-    x_rel = min(1.0, max(0.0, x_abs / W))
-    y_rel = min(1.0, max(0.0, y_abs / H))
-    kind = "tap" if tool == "Tap" else "shower"
-    st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
-    trigger_rerun()
+if res and tool in ("Tap", "Shower"):
+    # Protect against incomplete coordinate payloads that can occur during reruns
+    x = res.get("x")
+    y = res.get("y")
+    width = res.get("width") or render_width
+    height = res.get("height") or display_h
+    if None not in (x, y) and width and height:
+        # Convert absolute pixel to relative
+        scale_factor = width / display_w if display_w else 1.0
+        x_disp = x / scale_factor if scale_factor else x
+        y_disp = y / scale_factor if scale_factor else y
+        x_crop = x_disp * (view_w / display_w)
+        y_crop = y_disp * (view_h / display_h)
+        x_abs = left + x_crop
+        y_abs = top + y_crop
+        x_rel = min(1.0, max(0.0, x_abs / W))
+        y_rel = min(1.0, max(0.0, y_abs / H))
+        kind = "tap" if tool == "Tap" else "shower"
+        st.session_state.markers.append(Marker(kind=kind, x=x_rel, y=y_rel))
+        trigger_rerun()
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
