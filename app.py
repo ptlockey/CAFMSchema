@@ -547,7 +547,6 @@ def main():
     active_floor = st.session_state["active_floor"]
     floor = st.session_state["floors"][active_floor]
     floor_image = _get_floor_image(active_floor)
-    floor_image_data_url = _get_floor_image_data_url(active_floor)
     width, height = floor_image.size
 
     col_canvas, col_info = st.columns([3, 2])
@@ -578,7 +577,7 @@ def main():
         canvas_width = min(1200, width)
 
         canvas_result = st_canvas(
-            background_image=floor_image_data_url,
+            background_image=floor_image,
             update_streamlit=True,
             height=canvas_height,
             width=canvas_width,
