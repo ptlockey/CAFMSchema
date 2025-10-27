@@ -196,6 +196,13 @@ def _get_floor_image(floor_key: str) -> Image.Image:
     return Image.open(io.BytesIO(floor["image_bytes"]))
 
 
+def _get_floor_image_data_url(floor_key: str) -> str:
+    """Return the cached floor image as a base64 data URL string."""
+    floor = st.session_state["floors"][floor_key]
+    encoded = base64.b64encode(floor["image_bytes"]).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
 def _build_canvas_objects(floor_key: str) -> List[Dict]:
     floor = st.session_state["floors"][floor_key]
     width, height = floor["image_size"]
@@ -540,6 +547,7 @@ def main():
     active_floor = st.session_state["active_floor"]
     floor = st.session_state["floors"][active_floor]
     floor_image = _get_floor_image(active_floor)
+    floor_image_data_url = _get_floor_image_data_url(active_floor)
     width, height = floor_image.size
 
     col_canvas, col_info = st.columns([3, 2])
@@ -570,7 +578,7 @@ def main():
         canvas_width = min(1200, width)
 
         canvas_result = st_canvas(
-            background_image=floor_image,
+            background_image=floor_image_data_url,
             update_streamlit=True,
             height=canvas_height,
             width=canvas_width,
