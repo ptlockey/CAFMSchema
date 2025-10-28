@@ -30,7 +30,8 @@ def init_state():
     st.session_state.setdefault("pan_x", 0.0)
     st.session_state.setdefault("pan_y", 0.0)
     st.session_state.setdefault("tool_choice", "None")
-    st.session_state.setdefault("last_click", None)
+    st.session_state.setdefault("last_event_time", None)
+    st.session_state.setdefault("last_click_signature", None)
 
 init_state()
 
@@ -217,7 +218,8 @@ if choice == "JSON (with base64 image)":
                 mlist = node.get("markers") or []
                 st.session_state.markers = load_markers_from_json(mlist)
                 st.session_state.image_b64 = node.get("image_b64") or node.get("image_base64") or node.get("image")
-                st.session_state.last_click = None
+                st.session_state.last_event_time = None
+                st.session_state.last_click_signature = None
                 st.session_state.scale = 1.0
                 st.session_state.pan_x = 0.0
                 st.session_state.pan_y = 0.0
@@ -228,7 +230,8 @@ else:
         st.session_state.base_image = Image.open(f).convert("RGBA")
         st.session_state.mime = "image/png"
         st.session_state.image_b64 = None  # regenerate on export
-        st.session_state.last_click = None
+        st.session_state.last_event_time = None
+        st.session_state.last_click_signature = None
         st.session_state.markers = []
         _reset_id_counters([])
         st.session_state.scale = 1.0
@@ -248,7 +251,8 @@ clear = st.sidebar.button("Clear markers")
 
 if clear:
     st.session_state.markers = []
-    st.session_state.last_click = None
+    st.session_state.last_event_time = None
+    st.session_state.last_click_signature = None
     _reset_id_counters([])
 
 # View controls
@@ -317,11 +321,20 @@ if res and tool in ("Tap", "Shower"):
     x_rel = min(max(x_rel, 0.0), 1.0)
     y_rel = min(max(y_rel, 0.0), 1.0)
     kind = "tap" if tool == "Tap" else "shower"
-    # Append only if coordinates actually changed
-    if not st.session_state.get("last_click") == (x_rel, y_rel, kind):
+    event_time = res.get("unix_time") or res.get("time")
+    last_time = st.session_state.get("last_event_time")
+    should_add = True
+    if event_time is not None:
+        should_add = event_time != last_time
+    else:
+        signature = (res.get("x"), res.get("y"), len(st.session_state.markers))
+        should_add = signature != st.session_state.get("last_click_signature")
+        st.session_state.last_click_signature = signature
+    if should_add:
         identifier = next_marker_id(kind)
         st.session_state.markers.append(Marker(id=identifier, kind=kind, x=x_rel, y=y_rel))
-        st.session_state.last_click = (x_rel, y_rel, kind)
+        st.session_state.last_event_time = event_time
+        st.session_state.last_click_signature = None
 
 # Marker statistics
 tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
