@@ -496,6 +496,7 @@ with col_departments:
                 st.success(
                     f"Assigned {len(room_ids)} rooms to {dept_name.strip()}"
                 )
+                st.rerun()
 
     sanitized = st.session_state.rooms_df.copy()
     sanitized["department"] = (
