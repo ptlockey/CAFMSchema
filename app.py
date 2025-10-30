@@ -36,6 +36,8 @@ def init_state() -> None:
     st.session_state.setdefault("floorplan_image_bytes", None)
     st.session_state.setdefault("floorplan_image_meta", "")
     st.session_state.setdefault("floorplan_image_path", "")
+    st.session_state.setdefault("dept_room_select", [])
+    st.session_state.setdefault("clear_dept_room_select", False)
 
 
 init_state()
@@ -458,6 +460,8 @@ with col_departments:
             label = f"{room_id} — {display_name}" if display_name else room_id
             options.append(label)
             option_map[label] = room_id
+        if st.session_state.pop("clear_dept_room_select", False):
+            st.session_state["dept_room_select"] = []
         selections = st.multiselect(
             "Select rooms",
             options=options,
@@ -475,7 +479,7 @@ with col_departments:
                 mask = updated["room_id"].astype(str).isin(room_ids)
                 updated.loc[mask, "department"] = dept_name.strip()
                 st.session_state.rooms_df = updated
-                st.session_state.dept_room_select = []
+                st.session_state.clear_dept_room_select = True
                 st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name.strip()}'.")
 
     sanitized = st.session_state.rooms_df.copy()
