@@ -482,8 +482,7 @@ with col_departments:
         )
         submitted = st.form_submit_button("Assign selected rooms")
         if submitted:
-            dept_name_clean = dept_name.strip()
-            if not dept_name_clean:
+            if not dept_name.strip():
                 st.warning("Enter a department name before assigning rooms.")
             elif not selections:
                 st.warning("Select at least one room to assign.")
@@ -491,10 +490,12 @@ with col_departments:
                 room_ids = [option_map[sel] for sel in selections]
                 updated = st.session_state.rooms_df.copy()
                 mask = updated["room_id"].astype(str).isin(room_ids)
-                updated.loc[mask, "department"] = dept_name_clean
+                updated.loc[mask, "department"] = dept_name.strip()
                 st.session_state.rooms_df = updated
                 st.session_state.clear_dept_room_select = True
-                st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name_clean}'.")
+                st.success(
+                    f"Assigned {len(room_ids)} rooms to {dept_name.strip()}"
+                )
 
     sanitized = st.session_state.rooms_df.copy()
     sanitized["department"] = (
