@@ -1,365 +1,407 @@
-import base64
-import io
 import json
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+import pandas as pd
 import streamlit as st
-from streamlit_image_coordinates import streamlit_image_coordinates
 
-st.set_page_config(page_title="Schematic + Taps/Showers", layout="wide")
+st.set_page_config(page_title="Floorplan Room Manager", layout="wide")
 
-# ---------------- Models ----------------
+DATA_DIR = Path("data")
+DB_PATH = DATA_DIR / "floorplans.db"
+
+
 @dataclass
-class Marker:
-    id: str         # unique identifier e.g. T-001
-    kind: str       # "tap" or "shower"
-    x: float        # relative [0..1]
-    y: float        # relative [0..1]
+class ParsedRoom:
+    """Container for room data extracted from uploaded JSON."""
 
-# ---------------- State init ----------------
-def init_state():
-    st.session_state.setdefault("image", None)            # Display image with markers
-    st.session_state.setdefault("base_image", None)       # Original PIL image
-    st.session_state.setdefault("image_b64", None)        # data uri or raw b64
-    st.session_state.setdefault("mime", "image/png")
-    st.session_state.setdefault("markers", [])            # list[Marker]
-    st.session_state.setdefault("id_counters", {"tap": 0, "shower": 0})
-    st.session_state.setdefault("scale", 1.0)
-    st.session_state.setdefault("pan_x", 0.0)
-    st.session_state.setdefault("pan_y", 0.0)
-    st.session_state.setdefault("tool_choice", "None")
-    st.session_state.setdefault("last_event_time", None)
-    st.session_state.setdefault("last_click_signature", None)
+    room_id: str
+    source_name: str
+    geometry: Optional[Any]
+    attributes: Dict[str, Any]
+
+
+def init_state() -> None:
+    st.session_state.setdefault("rooms_df", None)
+    st.session_state.setdefault("room_lookup", {})
+    st.session_state.setdefault("floorplan_name", "")
+    st.session_state.setdefault("uploaded_filename", "")
+    st.session_state.setdefault("parse_message", "")
+
 
 init_state()
 
-# ---------------- Utilities ----------------
-def decode_image_from_json(obj: Dict) -> Tuple[Optional[Image.Image], Optional[str]]:
-    """Accepts several JSON layouts and returns (PIL image, mime)."""
-    if not isinstance(obj, dict):
-        return None, None
-    node = obj
-    # Common containers: {"pages":{"0":{...}}} or {"image_b64":...}
-    if "pages" in obj:
-        node = obj["pages"].get("0") or obj["pages"].get(0) or obj["pages"]
-    if not isinstance(node, dict):
-        return None, None
 
-    mime = node.get("mime") or "image/png"
-    # Key variants
-    val = node.get("image_b64") or node.get("image_base64") or node.get("image")
-    if not isinstance(val, str):
-        return None, None
-
-    # Strip data URI header if present
-    if val.startswith("data:image"):
-        try:
-            header, b64 = val.split(",", 1)
-            mime = header.split(";")[0].split(":")[1] or mime
-        except Exception:
-            b64 = val
-    else:
-        b64 = val
-
-    try:
-        img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
-        return img, mime
-    except Exception:
-        return None, None
-
-def encode_image_to_data_uri(img: Image.Image, mime: str = "image/png") -> str:
-    buf = io.BytesIO()
-    fmt = "PNG" if mime.endswith("png") else "JPEG"
-    img.save(buf, format=fmt)
-    return f"data:{mime};base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
-
-def _numeric_suffix(identifier: str) -> Optional[int]:
-    digits = "".join(ch for ch in identifier if ch.isdigit())
-    return int(digits) if digits else None
+def get_connection() -> sqlite3.Connection:
+    DATA_DIR.mkdir(exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS floorplans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            source_filename TEXT,
+            uploaded_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rooms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            floorplan_id INTEGER NOT NULL REFERENCES floorplans(id) ON DELETE CASCADE,
+            room_identifier TEXT NOT NULL,
+            source_name TEXT,
+            display_name TEXT,
+            department TEXT,
+            geometry TEXT,
+            attributes TEXT
+        )
+        """
+    )
+    return conn
 
 
-def _reset_id_counters(markers: List[Marker]):
-    counters = {"tap": 0, "shower": 0}
-    for marker in markers:
-        suffix = _numeric_suffix(marker.id) if isinstance(marker.id, str) else None
-        if suffix is not None:
-            counters.setdefault(marker.kind, 0)
-            counters[marker.kind] = max(counters[marker.kind], suffix)
-    st.session_state.id_counters = counters
+def find_room_list(obj: Any) -> Tuple[List[Dict[str, Any]], str]:
+    """Search the JSON payload for the most likely room list."""
+
+    if isinstance(obj, list) and obj and all(isinstance(item, dict) for item in obj):
+        return obj, "root"
+
+    queue: List[Tuple[Any, str]] = []
+    if isinstance(obj, dict):
+        queue.extend((value, key) for key, value in obj.items())
+    elif isinstance(obj, list):
+        queue.extend((value, f"root[{idx}]") for idx, value in enumerate(obj))
+
+    best_match: Tuple[List[Dict[str, Any]], str, int] = ([], "", -1)
+
+    while queue:
+        node, path = queue.pop(0)
+        if isinstance(node, list):
+            if node and all(isinstance(item, dict) for item in node):
+                score = score_room_list(node)
+                if score > best_match[2]:
+                    best_match = (node, path, score)
+            for idx, value in enumerate(node):
+                queue.append((value, f"{path}[{idx}]"))
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                queue.append((value, f"{path}.{key}" if path else key))
+
+    return best_match[0], best_match[1]
 
 
-def next_marker_id(kind: str, existing: Optional[set] = None) -> str:
-    """Return next unique marker id for the given kind."""
-    if existing is None:
-        existing = {m.id for m in st.session_state.markers}
-    prefix = "T" if kind == "tap" else "S"
-    counters = st.session_state.id_counters
-    counters.setdefault(kind, 0)
-    candidate = ""
-    while not candidate or candidate in existing:
-        counters[kind] += 1
-        candidate = f"{prefix}-{counters[kind]:03d}"
-    return candidate
+def score_room_list(items: List[Dict[str, Any]]) -> int:
+    """Heuristic to determine how likely a list of dicts is a room collection."""
+
+    room_keywords = {"room", "space", "area", "unit"}
+    score = 0
+    for item in items:
+        keys = " ".join(item.keys()).lower()
+        for keyword in room_keywords:
+            if keyword in keys:
+                score += 1
+        if any(k in item for k in ("id", "room_id", "name", "number")):
+            score += 1
+    return score
 
 
-def load_markers_from_json(raw_list: List[Dict]) -> List[Marker]:
-    markers: List[Marker] = []
-    counters = {"tap": 0, "shower": 0}
-    used_ids = {"tap": set(), "shower": set()}
-    for raw in raw_list:
+def coalesce(values: Iterable[Any], default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if not isinstance(value, str):
+            return str(value)
+    return default
+
+
+def parse_rooms(payload: Any) -> Tuple[List[ParsedRoom], str]:
+    rooms: List[ParsedRoom] = []
+    room_list, path = find_room_list(payload)
+    if not room_list:
+        return rooms, "Could not find a list of rooms in the uploaded JSON."
+
+    used_ids: Dict[str, int] = {}
+    for index, raw in enumerate(room_list, start=1):
         if not isinstance(raw, dict):
             continue
-        kind = raw.get("kind")
-        if kind not in ("tap", "shower"):
-            continue
-        try:
-            x = float(raw["x"])
-            y = float(raw["y"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        identifier = raw.get("id") if isinstance(raw.get("id"), str) else ""
-        identifier = identifier.strip()
-        if not identifier or identifier in used_ids[kind]:
-            identifier = ""
-        suffix = _numeric_suffix(identifier) if identifier else None
-        if suffix is not None:
-            counters[kind] = max(counters[kind], suffix)
-        if not identifier:
-            counters[kind] += 1
-            identifier = f"{'T' if kind == 'tap' else 'S'}-{counters[kind]:03d}"
-        used_ids[kind].add(identifier)
-        markers.append(Marker(id=identifier, kind=kind, x=x, y=y))
-    st.session_state.id_counters = counters
-    return markers
+        room_identifier = coalesce(
+            [
+                raw.get("id"),
+                raw.get("room_id"),
+                raw.get("roomId"),
+                raw.get("guid"),
+                raw.get("number"),
+                raw.get("name"),
+            ],
+            default=f"room-{index}",
+        )
+        base_identifier = room_identifier
+        counter = used_ids.get(base_identifier, 0)
+        if counter:
+            room_identifier = f"{base_identifier}-{counter+1}"
+        used_ids[base_identifier] = counter + 1
+
+        source_name = coalesce(
+            [
+                raw.get("name"),
+                raw.get("label"),
+                raw.get("displayName"),
+                raw.get("number"),
+            ]
+        )
+
+        geometry = None
+        for key in ("geometry", "polygon", "outline", "shape"):
+            if key in raw:
+                geometry = raw[key]
+                break
+        if geometry is None:
+            for key in ("coordinates", "points", "vertices"):
+                if key in raw and isinstance(raw[key], (list, dict)):
+                    geometry = {key: raw[key]}
+                    break
+
+        rooms.append(
+            ParsedRoom(
+                room_id=str(room_identifier),
+                source_name=str(source_name) if source_name else "",
+                geometry=geometry,
+                attributes=raw,
+            )
+        )
+
+    message = "Parsed rooms from path: " + (path or "root")
+    return rooms, message
 
 
-def draw_markers(base: Image.Image, markers: List[Marker]) -> Image.Image:
-    img = base.copy()
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.load_default()
-    W, H = img.size
-    r = max(6, int(min(W, H) * 0.012))
-
-    for m in markers:
-        x = int(m.x * W)
-        y = int(m.y * H)
-        if not (0 <= x <= W and 0 <= y <= H):
-            continue
-        color = (220, 32, 32, 230) if m.kind == "tap" else (30, 108, 255, 230)
-        label_color = (0, 0, 0, 255)
-        # Circle
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=color, outline=(0, 0, 0, 200), width=1)
-        # Label with simple background for readability
-        text = m.id
-        text_size = draw.textbbox((0, 0), text, font=font)
-        text_w = text_size[2] - text_size[0]
-        text_h = text_size[3] - text_size[1]
-        pad = 2
-        box = (x + r + pad, y - text_h // 2 - pad, x + r + pad + text_w + pad, y - text_h // 2 + text_h + pad)
-        draw.rectangle(box, fill=(255, 255, 255, 220))
-        draw.text((box[0] + pad, box[1] + pad // 2), text, fill=label_color, font=font)
-    return img
-
-
-def build_view_image(base: Image.Image, markers: List[Marker], scale: float, pan_x: float, pan_y: float) -> Tuple[Image.Image, Dict[str, float]]:
-    annotated = draw_markers(base, markers)
-    W, H = annotated.size
-    if scale <= 1.0:
-        return annotated, {"offset_x": 0.0, "offset_y": 0.0, "scale": 1.0}
-
-    scaled_size = (int(W * scale), int(H * scale))
-    zoomed = annotated.resize(scaled_size, Image.BICUBIC)
-    max_x = max(scaled_size[0] - W, 0)
-    max_y = max(scaled_size[1] - H, 0)
-    offset_x = int(max_x * min(max(pan_x, 0.0), 1.0))
-    offset_y = int(max_y * min(max(pan_y, 0.0), 1.0))
-    cropped = zoomed.crop((offset_x, offset_y, offset_x + W, offset_y + H))
-    return cropped, {"offset_x": offset_x, "offset_y": offset_y, "scale": scale}
-
-def export_json() -> bytes:
-    # Build a compact export with embedded base64 and markers
-    base_img = st.session_state.base_image or st.session_state.image
-    data_uri = st.session_state.image_b64 or encode_image_to_data_uri(base_img, st.session_state.mime)
-    export = {
-        "pages": {
-            "0": {
-                "mime": st.session_state.mime,
-                "image_b64": data_uri,
-                "markers": [asdict(m) for m in st.session_state.markers]
-            }
-        }
-    }
-    return json.dumps(export, indent=2).encode("utf-8")
-
-# ---------------- Sidebar controls ----------------
-st.sidebar.header("Load schematic")
-
-choice = st.sidebar.selectbox("Source", ["JSON (with base64 image)", "Image file (PNG/JPG)"])
-
-if choice == "JSON (with base64 image)":
-    j = st.sidebar.file_uploader("Upload JSON", type=["json"])
-    if j is not None:
-        try:
-            obj = json.loads(j.read().decode("utf-8"))
-        except Exception:
-            st.sidebar.error("Not valid JSON.")
-            obj = None
-        if obj:
-            img, mime = decode_image_from_json(obj)
-            if img is None:
-                st.sidebar.error("JSON did not include a valid base64-encoded image.")
-            else:
-                st.session_state.base_image = img
-                st.session_state.mime = mime or "image/png"
-                # Load any markers if present
-                node = obj.get("pages",{}).get("0",{})
-                mlist = node.get("markers") or []
-                st.session_state.markers = load_markers_from_json(mlist)
-                st.session_state.image_b64 = node.get("image_b64") or node.get("image_base64") or node.get("image")
-                st.session_state.last_event_time = None
-                st.session_state.last_click_signature = None
-                st.session_state.scale = 1.0
-                st.session_state.pan_x = 0.0
-                st.session_state.pan_y = 0.0
-
-else:
-    f = st.sidebar.file_uploader("Upload image", type=["png","jpg","jpeg"])
-    if f is not None:
-        st.session_state.base_image = Image.open(f).convert("RGBA")
-        st.session_state.mime = "image/png"
-        st.session_state.image_b64 = None  # regenerate on export
-        st.session_state.last_event_time = None
-        st.session_state.last_click_signature = None
-        st.session_state.markers = []
-        _reset_id_counters([])
-        st.session_state.scale = 1.0
-        st.session_state.pan_x = 0.0
-        st.session_state.pan_y = 0.0
-
-# Marker tools
-st.sidebar.header("Tools")
-tool_options = ["Tap", "Shower", "None"]
-tool = st.sidebar.radio(
-    "Add marker",
-    tool_options,
-    key="tool_choice",
-    horizontal=True,
-)
-clear = st.sidebar.button("Clear markers")
-
-if clear:
-    st.session_state.markers = []
-    st.session_state.last_event_time = None
-    st.session_state.last_click_signature = None
-    _reset_id_counters([])
-
-# View controls
-st.sidebar.header("View controls")
-scale = st.sidebar.slider(
-    "Zoom",
-    min_value=1.0,
-    max_value=4.0,
-    value=float(st.session_state.scale),
-    step=0.1,
-)
-st.session_state.scale = scale
-
-if scale > 1.0:
-    st.session_state.pan_x = st.sidebar.slider(
-        "Pan X",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.pan_x),
-        step=0.01,
-    )
-    st.session_state.pan_y = st.sidebar.slider(
-        "Pan Y",
-        min_value=0.0,
-        max_value=1.0,
-        value=float(st.session_state.pan_y),
-        step=0.01,
-    )
-else:
-    st.session_state.pan_x = 0.0
-    st.session_state.pan_y = 0.0
-    st.sidebar.caption("Zoom in to enable pan controls.")
-
-# ---------------- Main canvas ----------------
-base_image = st.session_state.base_image or st.session_state.image
-
-if base_image is None:
-    st.info("Upload a schematic (JSON with base64 image, or a PNG/JPG).")
-    st.stop()
-
-display_img, view_params = build_view_image(
-    base_image,
-    st.session_state.markers,
-    st.session_state.scale,
-    st.session_state.pan_x,
-    st.session_state.pan_y,
-)
-st.session_state.image = display_img
-st.session_state.view_params = view_params
-
-st.write("Click on the image to add markers.")
-
-res = streamlit_image_coordinates(
-    st.session_state.image, key="img_click", width=min(1200, st.session_state.image.width)
-)
-
-if res and tool in ("Tap", "Shower"):
-    base_W, base_H = base_image.size
-    scale_factor = max(view_params.get("scale", 1.0), 1e-6)
-    offset_x = view_params.get("offset_x", 0.0)
-    offset_y = view_params.get("offset_y", 0.0)
-    x_display = res.get("x", 0)
-    y_display = res.get("y", 0)
-    x_rel = (offset_x + x_display) / (scale_factor * base_W)
-    y_rel = (offset_y + y_display) / (scale_factor * base_H)
-    x_rel = min(max(x_rel, 0.0), 1.0)
-    y_rel = min(max(y_rel, 0.0), 1.0)
-    kind = "tap" if tool == "Tap" else "shower"
-    event_time = res.get("unix_time") or res.get("time")
-    last_time = st.session_state.get("last_event_time")
-    should_add = True
-    if event_time is not None:
-        should_add = event_time != last_time
-    else:
-        signature = (res.get("x"), res.get("y"), len(st.session_state.markers))
-        should_add = signature != st.session_state.get("last_click_signature")
-        st.session_state.last_click_signature = signature
-    if should_add:
-        identifier = next_marker_id(kind)
-        st.session_state.markers.append(Marker(id=identifier, kind=kind, x=x_rel, y=y_rel))
-        st.session_state.last_event_time = event_time
-        st.session_state.last_click_signature = None
-
-# Marker statistics
-tap_count = sum(1 for m in st.session_state.markers if m.kind == "tap")
-shower_count = sum(1 for m in st.session_state.markers if m.kind == "shower")
-col_tap, col_shower = st.columns(2)
-col_tap.metric("Taps", tap_count)
-col_shower.metric("Showers", shower_count)
-
-# Show a table
-if st.session_state.markers:
-    st.subheader("Markers")
-    base_W, base_H = base_image.size
-    table_rows = []
-    for marker in sorted(st.session_state.markers, key=lambda m: m.id):
-        table_rows.append(
+def build_rooms_dataframe(rooms: List[ParsedRoom]) -> pd.DataFrame:
+    data = []
+    for room in rooms:
+        data.append(
             {
-                "ID": marker.id,
-                "Type": marker.kind.title(),
-                "X (relative)": round(marker.x, 4),
-                "Y (relative)": round(marker.y, 4),
-                "X (px)": int(round(marker.x * base_W)),
-                "Y (px)": int(round(marker.y * base_H)),
+                "room_id": room.room_id,
+                "source_name": room.source_name,
+                "display_name": room.source_name or room.room_id,
+                "department": "",
             }
         )
-    st.dataframe(table_rows, use_container_width=True)
+    df = pd.DataFrame(data)
+    df.set_index("room_id", inplace=True)
+    return df
 
-# Export
-st.download_button("Download JSON with image + markers", data=export_json(), file_name="schematic_with_markers.json", mime="application/json")
+
+def save_floorplan_to_db(name: str, filename: str, df: pd.DataFrame, lookup: Dict[str, ParsedRoom]) -> int:
+    conn = get_connection()
+    try:
+        timestamp = datetime.utcnow().isoformat(timespec="seconds")
+        cursor = conn.execute(
+            "INSERT INTO floorplans (name, source_filename, uploaded_at) VALUES (?, ?, ?)",
+            (name, filename, timestamp),
+        )
+        floorplan_id = cursor.lastrowid
+        records = df.reset_index().to_dict(orient="records")
+        for record in records:
+            room_id = record.get("room_id")
+            parsed_room = lookup.get(room_id)
+            geometry_json = json.dumps(parsed_room.geometry) if parsed_room and parsed_room.geometry is not None else None
+            attributes_json = json.dumps(parsed_room.attributes) if parsed_room else None
+            source_name = record.get("source_name")
+            display_name = record.get("display_name")
+            department = record.get("department")
+            if pd.isna(source_name):
+                source_name = None
+            if pd.isna(display_name):
+                display_name = None
+            if pd.isna(department):
+                department = None
+            conn.execute(
+                """
+                INSERT INTO rooms (floorplan_id, room_identifier, source_name, display_name, department, geometry, attributes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    floorplan_id,
+                    room_id,
+                    source_name,
+                    display_name,
+                    department,
+                    geometry_json,
+                    attributes_json,
+                ),
+            )
+        conn.commit()
+        return floorplan_id
+    finally:
+        conn.close()
+
+
+def load_saved_floorplans() -> pd.DataFrame:
+    if not DB_PATH.exists():
+        return pd.DataFrame(columns=["id", "name", "source_filename", "uploaded_at", "room_count"])
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT f.id, f.name, f.source_filename, f.uploaded_at, COUNT(r.id) AS room_count
+            FROM floorplans f
+            LEFT JOIN rooms r ON r.floorplan_id = f.id
+            GROUP BY f.id
+            ORDER BY f.uploaded_at DESC
+            """,
+            conn,
+        )
+        return df
+    finally:
+        conn.close()
+
+
+def load_rooms_for_floorplan(floorplan_id: int) -> pd.DataFrame:
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT room_identifier AS room_id, source_name, display_name, department
+            FROM rooms
+            WHERE floorplan_id = ?
+            ORDER BY room_identifier
+            """,
+            conn,
+            params=(floorplan_id,),
+        )
+        return df
+    finally:
+        conn.close()
+
+
+st.title("Floorplan Room Manager")
+st.caption(
+    "Upload a floorplan JSON file, name rooms, assign departments, and store the results in a SQLite database."
+)
+
+uploaded = st.file_uploader("Upload floorplan JSON", type=["json"], accept_multiple_files=False)
+if uploaded is not None:
+    try:
+        payload = json.loads(uploaded.read().decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        st.error(f"Could not decode JSON: {exc}")
+        payload = None
+    if payload is not None:
+        rooms, message = parse_rooms(payload)
+        if not rooms:
+            st.error("No rooms could be parsed from the uploaded file.")
+            st.session_state.parse_message = message
+            st.session_state.rooms_df = None
+            st.session_state.room_lookup = {}
+        else:
+            st.session_state.rooms_df = build_rooms_dataframe(rooms)
+            st.session_state.room_lookup = {room.room_id: room for room in rooms}
+            default_name = Path(uploaded.name).stem
+            st.session_state.floorplan_name = default_name
+            st.session_state.uploaded_filename = uploaded.name
+            st.session_state.parse_message = message
+
+if st.session_state.parse_message:
+    st.info(st.session_state.parse_message)
+
+if st.session_state.rooms_df is None or st.session_state.rooms_df.empty:
+    st.stop()
+
+st.subheader("Room details")
+
+col_rooms, col_departments = st.columns([2.5, 1.5])
+
+with col_rooms:
+    st.session_state.floorplan_name = st.text_input(
+        "Floorplan name",
+        value=st.session_state.floorplan_name,
+        help="Name of the floorplan to store in the database.",
+    )
+
+    edited_df = st.data_editor(
+        st.session_state.rooms_df,
+        column_config={
+            "source_name": st.column_config.TextColumn("Source name", help="Name from the uploaded file."),
+            "display_name": st.column_config.TextColumn("Display name", help="Name that will be saved for the room."),
+            "department": st.column_config.TextColumn("Department", help="Department assignment for the room."),
+        },
+        use_container_width=True,
+        hide_index=False,
+        num_rows="fixed",
+        key="rooms_editor",
+    )
+    st.session_state.rooms_df = edited_df
+
+with col_departments:
+    st.markdown("### Department assignment")
+    with st.form("department_form"):
+        dept_name = st.text_input("Department name", key="dept_name_input")
+        options: List[str] = []
+        option_map: Dict[str, str] = {}
+        for room_id, row in st.session_state.rooms_df.iterrows():
+            label = f"{room_id} — {row['display_name']}" if row["display_name"] else str(room_id)
+            options.append(label)
+            option_map[label] = str(room_id)
+        selections = st.multiselect(
+            "Select rooms",
+            options=options,
+            key="dept_room_select",
+        )
+        submitted = st.form_submit_button("Assign selected rooms")
+        if submitted:
+            if not dept_name.strip():
+                st.warning("Enter a department name before assigning rooms.")
+            elif not selections:
+                st.warning("Select at least one room to assign.")
+            else:
+                room_ids = [option_map[sel] for sel in selections]
+                updated = st.session_state.rooms_df.copy()
+                updated.loc[room_ids, "department"] = dept_name.strip()
+                st.session_state.rooms_df = updated
+                st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name.strip()}'.")
+
+    grouped = st.session_state.rooms_df.groupby("department")
+    st.markdown("#### Current departments")
+    if grouped.ngroups == 0 or (grouped.ngroups == 1 and "" in grouped.groups):
+        st.caption("No departments assigned yet.")
+    else:
+        for dept, group in grouped:
+            if not dept:
+                continue
+            st.write(f"**{dept}** ({len(group)} rooms)")
+            st.caption(", ".join(group["display_name"].tolist()))
+
+save_disabled = not st.session_state.floorplan_name.strip()
+
+if st.button("Save to database", type="primary", disabled=save_disabled):
+    floorplan_id = save_floorplan_to_db(
+        st.session_state.floorplan_name.strip(),
+        st.session_state.uploaded_filename,
+        st.session_state.rooms_df,
+        st.session_state.room_lookup,
+    )
+    st.success(f"Floorplan saved with id {floorplan_id}.")
+
+st.markdown("---")
+
+st.subheader("Saved floorplans")
+saved = load_saved_floorplans()
+if saved.empty:
+    st.caption("No floorplans have been saved yet.")
+else:
+    st.dataframe(saved, use_container_width=True)
+    selected_id = st.selectbox(
+        "View rooms for saved floorplan",
+        options=["None"] + saved["id"].astype(str).tolist(),
+        index=0,
+    )
+    if selected_id != "None":
+        rooms_df = load_rooms_for_floorplan(int(selected_id))
+        st.dataframe(rooms_df, use_container_width=True)
