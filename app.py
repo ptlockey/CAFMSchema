@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -7,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+from PIL import Image, UnidentifiedImageError
 
 st.set_page_config(page_title="Floorplan Room Manager", layout="wide")
 
@@ -30,6 +33,9 @@ def init_state() -> None:
     st.session_state.setdefault("floorplan_name", "")
     st.session_state.setdefault("uploaded_filename", "")
     st.session_state.setdefault("parse_message", "")
+    st.session_state.setdefault("floorplan_image_bytes", None)
+    st.session_state.setdefault("floorplan_image_meta", "")
+    st.session_state.setdefault("floorplan_image_path", "")
 
 
 init_state()
@@ -109,6 +115,76 @@ def score_room_list(items: List[Dict[str, Any]]) -> int:
         if any(k in item for k in ("id", "room_id", "name", "number")):
             score += 1
     return score
+
+
+def decode_base64_image(data: str) -> Optional[Tuple[bytes, str, Tuple[int, int]]]:
+    """Attempt to decode a base64 string into image bytes, returning metadata if valid."""
+
+    text = data.strip()
+    if not text:
+        return None
+
+    mime: Optional[str] = None
+    if text.startswith("data:image"):
+        try:
+            header, payload = text.split(",", 1)
+        except ValueError:
+            return None
+        mime = header.split(";", 1)[0].split(":", 1)[-1]
+        text = payload
+
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except Exception:
+        try:
+            raw = base64.b64decode(text)
+        except Exception:
+            return None
+
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img.load()
+            size = img.size
+            fmt = img.format or (mime.split("/", 1)[-1].upper() if mime else "Image")
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+
+    return raw, fmt, size
+
+
+def find_image_data(obj: Any, path: str = "") -> Optional[Tuple[bytes, str, Tuple[int, int], str]]:
+    """Traverse arbitrary JSON payload to locate the first decodable image."""
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            new_path = f"{path}.{key}" if path else key
+            if isinstance(value, str):
+                decoded = decode_base64_image(value)
+                if decoded:
+                    raw, fmt, size = decoded
+                    return raw, fmt, size, new_path
+            else:
+                result = find_image_data(value, new_path)
+                if result:
+                    return result
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            result = find_image_data(item, new_path)
+            if result:
+                return result
+    return None
+
+
+def extract_image_from_payload(payload: Any) -> Tuple[Optional[bytes], Optional[str], str]:
+    """Return raw image bytes, a metadata caption, and the JSON path for any embedded image."""
+
+    found = find_image_data(payload)
+    if not found:
+        return None, None, ""
+    raw, fmt, size, path = found
+    caption = f"{fmt} {size[0]}×{size[1]}px"
+    return raw, caption, path
 
 
 def coalesce(values: Iterable[Any], default: str = "") -> str:
@@ -295,11 +371,19 @@ if uploaded is not None:
         payload = None
     if payload is not None:
         rooms, message = parse_rooms(payload)
+        image_bytes, image_meta, image_path = extract_image_from_payload(payload)
+        st.session_state.floorplan_image_bytes = image_bytes
+        st.session_state.floorplan_image_meta = image_meta or ""
+        st.session_state.floorplan_image_path = image_path
         if not rooms:
             st.error("No rooms could be parsed from the uploaded file.")
             st.session_state.parse_message = message
             st.session_state.rooms_df = None
             st.session_state.room_lookup = {}
+            if image_bytes is None:
+                st.session_state.floorplan_image_bytes = None
+                st.session_state.floorplan_image_meta = ""
+                st.session_state.floorplan_image_path = ""
         else:
             st.session_state.rooms_df = build_rooms_dataframe(rooms)
             st.session_state.room_lookup = {room.room_id: room for room in rooms}
@@ -310,6 +394,16 @@ if uploaded is not None:
 
 if st.session_state.parse_message:
     st.info(st.session_state.parse_message)
+
+if st.session_state.floorplan_image_bytes is not None:
+    st.subheader("Floorplan image")
+    caption_parts: List[str] = []
+    if st.session_state.floorplan_image_meta:
+        caption_parts.append(st.session_state.floorplan_image_meta)
+    if st.session_state.floorplan_image_path:
+        caption_parts.append(f"JSON path: {st.session_state.floorplan_image_path}")
+    caption = " • ".join(caption_parts) if caption_parts else None
+    st.image(st.session_state.floorplan_image_bytes, caption=caption, use_column_width=True)
 
 if st.session_state.rooms_df is None or st.session_state.rooms_df.empty:
     st.stop()
@@ -365,6 +459,7 @@ with col_departments:
                 updated = st.session_state.rooms_df.copy()
                 updated.loc[room_ids, "department"] = dept_name.strip()
                 st.session_state.rooms_df = updated
+                st.session_state.pop("rooms_editor", None)
                 st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name.strip()}'.")
 
     grouped = st.session_state.rooms_df.groupby("department")
