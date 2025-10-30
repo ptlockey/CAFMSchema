@@ -274,6 +274,12 @@ def build_rooms_dataframe(rooms: List[ParsedRoom]) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialize a DataFrame to UTF-8 encoded CSV bytes suitable for download."""
+
+    return df.to_csv(index=False).encode("utf-8")
+
+
 def save_floorplan_to_db(name: str, filename: str, df: pd.DataFrame, lookup: Dict[str, ParsedRoom]) -> int:
     conn = get_connection()
     try:
@@ -447,6 +453,13 @@ with col_rooms:
     if "room_id" not in edited_df.columns:
         edited_df = edited_df.reset_index().rename(columns={"index": "room_id"})
     st.session_state.rooms_df = edited_df
+    export_name = st.session_state.floorplan_name.strip() or "rooms"
+    st.download_button(
+        "Download current rooms (CSV)",
+        dataframe_to_csv_bytes(st.session_state.rooms_df),
+        file_name=f"{export_name}_rooms.csv",
+        mime="text/csv",
+    )
 
 with col_departments:
     st.markdown("### Department assignment")
@@ -469,7 +482,8 @@ with col_departments:
         )
         submitted = st.form_submit_button("Assign selected rooms")
         if submitted:
-            if not dept_name.strip():
+            dept_name_clean = dept_name.strip()
+            if not dept_name_clean:
                 st.warning("Enter a department name before assigning rooms.")
             elif not selections:
                 st.warning("Select at least one room to assign.")
@@ -477,10 +491,10 @@ with col_departments:
                 room_ids = [option_map[sel] for sel in selections]
                 updated = st.session_state.rooms_df.copy()
                 mask = updated["room_id"].astype(str).isin(room_ids)
-                updated.loc[mask, "department"] = dept_name.strip()
+                updated.loc[mask, "department"] = dept_name_clean
                 st.session_state.rooms_df = updated
                 st.session_state.clear_dept_room_select = True
-                st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name.strip()}'.")
+                st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name_clean}'.")
 
     sanitized = st.session_state.rooms_df.copy()
     sanitized["department"] = (
@@ -514,6 +528,12 @@ if saved.empty:
     st.caption("No floorplans have been saved yet.")
 else:
     st.dataframe(saved, use_container_width=True)
+    st.download_button(
+        "Download saved floorplans (CSV)",
+        dataframe_to_csv_bytes(saved),
+        file_name="saved_floorplans.csv",
+        mime="text/csv",
+    )
     selected_id = st.selectbox(
         "View rooms for saved floorplan",
         options=["None"] + saved["id"].astype(str).tolist(),
@@ -522,3 +542,9 @@ else:
     if selected_id != "None":
         rooms_df = load_rooms_for_floorplan(int(selected_id))
         st.dataframe(rooms_df, use_container_width=True)
+        st.download_button(
+            "Download rooms for selected floorplan (CSV)",
+            dataframe_to_csv_bytes(rooms_df),
+            file_name=f"floorplan_{selected_id}_rooms.csv",
+            mime="text/csv",
+        )
