@@ -269,9 +269,7 @@ def build_rooms_dataframe(rooms: List[ParsedRoom]) -> pd.DataFrame:
                 "department": "",
             }
         )
-    df = pd.DataFrame(data)
-    df.set_index("room_id", inplace=True)
-    return df
+    return pd.DataFrame(data)
 
 
 def save_floorplan_to_db(name: str, filename: str, df: pd.DataFrame, lookup: Dict[str, ParsedRoom]) -> int:
@@ -283,7 +281,7 @@ def save_floorplan_to_db(name: str, filename: str, df: pd.DataFrame, lookup: Dic
             (name, filename, timestamp),
         )
         floorplan_id = cursor.lastrowid
-        records = df.reset_index().to_dict(orient="records")
+        records = df.to_dict(orient="records")
         for record in records:
             room_id = record.get("room_id")
             parsed_room = lookup.get(room_id)
@@ -422,15 +420,30 @@ with col_rooms:
     edited_df = st.data_editor(
         st.session_state.rooms_df,
         column_config={
-            "source_name": st.column_config.TextColumn("Source name", help="Name from the uploaded file."),
-            "display_name": st.column_config.TextColumn("Display name", help="Name that will be saved for the room."),
-            "department": st.column_config.TextColumn("Department", help="Department assignment for the room."),
+            "room_id": st.column_config.TextColumn(
+                "Room ID",
+                help="Unique identifier parsed from the uploaded JSON.",
+                disabled=True,
+            ),
+            "source_name": st.column_config.TextColumn(
+                "Source name",
+                help="Name from the uploaded file.",
+            ),
+            "display_name": st.column_config.TextColumn(
+                "Display name",
+                help="Name that will be saved for the room.",
+            ),
+            "department": st.column_config.TextColumn(
+                "Department",
+                help="Department assignment for the room.",
+            ),
         },
         use_container_width=True,
-        hide_index=False,
+        hide_index=True,
         num_rows="fixed",
-        key="rooms_editor",
     )
+    if "room_id" not in edited_df.columns:
+        edited_df = edited_df.reset_index().rename(columns={"index": "room_id"})
     st.session_state.rooms_df = edited_df
 
 with col_departments:
@@ -439,10 +452,12 @@ with col_departments:
         dept_name = st.text_input("Department name", key="dept_name_input")
         options: List[str] = []
         option_map: Dict[str, str] = {}
-        for room_id, row in st.session_state.rooms_df.iterrows():
-            label = f"{room_id} — {row['display_name']}" if row["display_name"] else str(room_id)
+        for _, row in st.session_state.rooms_df.iterrows():
+            room_id = str(row["room_id"])
+            display_name = row["display_name"] if pd.notna(row["display_name"]) else ""
+            label = f"{room_id} — {display_name}" if display_name else room_id
             options.append(label)
-            option_map[label] = str(room_id)
+            option_map[label] = room_id
         selections = st.multiselect(
             "Select rooms",
             options=options,
@@ -457,21 +472,24 @@ with col_departments:
             else:
                 room_ids = [option_map[sel] for sel in selections]
                 updated = st.session_state.rooms_df.copy()
-                updated.loc[room_ids, "department"] = dept_name.strip()
+                mask = updated["room_id"].astype(str).isin(room_ids)
+                updated.loc[mask, "department"] = dept_name.strip()
                 st.session_state.rooms_df = updated
-                st.session_state.pop("rooms_editor", None)
+                st.session_state.dept_room_select = []
                 st.success(f"Assigned {len(room_ids)} room(s) to '{dept_name.strip()}'.")
 
-    grouped = st.session_state.rooms_df.groupby("department")
+    sanitized = st.session_state.rooms_df.copy()
+    sanitized["department"] = (
+        sanitized["department"].fillna("").astype(str).str.strip()
+    )
+    assigned_mask = sanitized["department"] != ""
     st.markdown("#### Current departments")
-    if grouped.ngroups == 0 or (grouped.ngroups == 1 and "" in grouped.groups):
+    if not assigned_mask.any():
         st.caption("No departments assigned yet.")
     else:
-        for dept, group in grouped:
-            if not dept:
-                continue
+        for dept, group in sanitized[assigned_mask].groupby("department"):
             st.write(f"**{dept}** ({len(group)} rooms)")
-            st.caption(", ".join(group["display_name"].tolist()))
+            st.caption(", ".join(group["display_name"].fillna("").tolist()))
 
 save_disabled = not st.session_state.floorplan_name.strip()
 
