@@ -5,6 +5,7 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from numbers import Number
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -432,6 +433,22 @@ def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> O
     return ring
 
 
+# Helpers -----------------------------------------------------------------
+
+
+def _coerce_non_negative_int(value: Any) -> Optional[int]:
+    """Return a non-negative integer if ``value`` encodes one."""
+
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, Number):
+        if math.isfinite(float(value)):
+            as_int = int(round(float(value)))
+            if as_int >= 0 and abs(float(value) - as_int) < 1e-9:
+                return as_int
+    return None
+
+
 def update_geometries_from_canvas(
     data: Dict[str, Any],
     lookup: Dict[str, "ParsedRoom"],
@@ -470,10 +487,10 @@ def update_geometries_from_canvas(
         if not room_id or room_id not in lookup:
             continue
         if payload.get("kind") == "vertex":
-            ring_index = payload.get("ring_index")
-            vertex_index = payload.get("vertex_index")
-            vertex_count = payload.get("vertex_count")
-            if not isinstance(ring_index, int) or not isinstance(vertex_index, int):
+            ring_index = _coerce_non_negative_int(payload.get("ring_index"))
+            vertex_index = _coerce_non_negative_int(payload.get("vertex_index"))
+            vertex_count = _coerce_non_negative_int(payload.get("vertex_count"))
+            if ring_index is None or vertex_index is None:
                 continue
             center_x = obj.get("left")
             center_y = obj.get("top")
@@ -484,14 +501,14 @@ def update_geometries_from_canvas(
             x, y = canvas_to_world(cx, cy, transform)
             key = (room_id, ring_index)
             vertex_positions.setdefault(key, {})[vertex_index] = (x, y)
-            if isinstance(vertex_count, int):
+            if vertex_count is not None:
                 vertex_counts[key] = vertex_count
         else:
             ring = canvas_object_to_ring(obj, transform)
             if not ring:
                 continue
-            ring_index = payload.get("ring_index")
-            if isinstance(ring_index, int):
+            ring_index = _coerce_non_negative_int(payload.get("ring_index"))
+            if ring_index is not None:
                 key = (room_id, ring_index)
                 if key in handled_rings:
                     continue
