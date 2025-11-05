@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
+from streamlit_drawable_canvas import st_canvas
 
 st.set_page_config(page_title="Floorplan Room Manager", layout="wide")
 
@@ -38,6 +40,7 @@ def init_state() -> None:
     st.session_state.setdefault("floorplan_image_path", "")
     st.session_state.setdefault("dept_room_select", [])
     st.session_state.setdefault("clear_dept_room_select", False)
+    st.session_state.setdefault("geometry_transform", None)
 
 
 init_state()
@@ -200,7 +203,222 @@ def coalesce(values: Iterable[Any], default: str = "") -> str:
     return default
 
 
+def is_geojson_payload(payload: Any) -> bool:
+    return isinstance(payload, dict) and payload.get("type") in {"FeatureCollection", "Feature"}
+
+
+def normalize_polygon(coords: Any) -> Optional[List[List[float]]]:
+    """Return a list of [x, y] pairs for the outer ring of a polygon."""
+
+    if not isinstance(coords, list) or not coords:
+        return None
+    first = coords[0]
+    if not isinstance(first, list):
+        return None
+    if first and isinstance(first[0], (int, float)):
+        points = []
+        for pair in coords:
+            if (
+                isinstance(pair, list)
+                and len(pair) >= 2
+                and isinstance(pair[0], (int, float))
+                and isinstance(pair[1], (int, float))
+            ):
+                points.append([float(pair[0]), float(pair[1])])
+        return points or None
+    if first and isinstance(first[0], list):
+        # Standard GeoJSON polygon -> coords[0] is exterior ring
+        return normalize_polygon(first)
+    return None
+
+
+def geometry_to_rings(geometry: Any) -> List[List[List[float]]]:
+    """Return a list of polygon rings for the provided geometry."""
+
+    if geometry is None:
+        return []
+    if isinstance(geometry, dict):
+        g_type = geometry.get("type")
+        coords = geometry.get("coordinates")
+        if g_type == "Polygon":
+            ring = normalize_polygon(coords)
+            return [ring] if ring else []
+        if g_type == "MultiPolygon" and isinstance(coords, list):
+            rings: List[List[List[float]]] = []
+            for poly in coords:
+                ring = normalize_polygon(poly)
+                if ring:
+                    rings.append(ring)
+            return rings
+        # Some payloads may wrap geometry
+        if isinstance(coords, dict):
+            return geometry_to_rings(coords)
+    if isinstance(geometry, list):
+        ring = normalize_polygon(geometry)
+        return [ring] if ring else []
+    return []
+
+
+def iter_geometry_points(lookup: Dict[str, "ParsedRoom"]) -> Iterable[Tuple[float, float]]:
+    for room in lookup.values():
+        for ring in geometry_to_rings(room.geometry):
+            for x, y in ring:
+                yield x, y
+
+
+def compute_geometry_bounds(lookup: Dict[str, "ParsedRoom"]) -> Optional[Tuple[float, float, float, float]]:
+    xs: List[float] = []
+    ys: List[float] = []
+    for x, y in iter_geometry_points(lookup):
+        xs.append(x)
+        ys.append(y)
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def build_geometry_transform(lookup: Dict[str, "ParsedRoom"], canvas_size: int = 900) -> Optional[Dict[str, float]]:
+    bounds = compute_geometry_bounds(lookup)
+    if not bounds:
+        return None
+    min_x, min_y, max_x, max_y = bounds
+    width = max(max_x - min_x, 1e-6)
+    height = max(max_y - min_y, 1e-6)
+    margin = canvas_size * 0.05
+    usable_w = canvas_size - 2 * margin
+    usable_h = canvas_size - 2 * margin
+    scale = min(usable_w / width if width else 1.0, usable_h / height if height else 1.0)
+    offset_x = margin
+    offset_y = margin
+    canvas_width = math.ceil(width * scale + 2 * margin)
+    canvas_height = math.ceil(height * scale + 2 * margin)
+    return {
+        "min_x": float(min_x),
+        "max_x": float(max_x),
+        "min_y": float(min_y),
+        "max_y": float(max_y),
+        "scale": float(scale),
+        "offset_x": float(offset_x),
+        "offset_y": float(offset_y),
+        "canvas_width": float(canvas_width),
+        "canvas_height": float(canvas_height),
+    }
+
+
+def world_to_canvas(x: float, y: float, transform: Dict[str, float]) -> Tuple[float, float]:
+    scale = transform["scale"]
+    cx = (x - transform["min_x"]) * scale + transform["offset_x"]
+    # Invert Y so north is up when rendered on the canvas (origin top-left)
+    cy = (transform["max_y"] - y) * scale + transform["offset_y"]
+    return cx, cy
+
+
+def canvas_to_world(cx: float, cy: float, transform: Dict[str, float]) -> Tuple[float, float]:
+    scale = transform["scale"]
+    x = (cx - transform["offset_x"]) / scale + transform["min_x"]
+    y = transform["max_y"] - ((cy - transform["offset_y"]) / scale)
+    return x, y
+
+
+def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dict[str, float]) -> Dict[str, Any]:
+    objects: List[Dict[str, Any]] = []
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    room_ids = sorted(lookup.keys())
+    for idx, room_id in enumerate(room_ids):
+        room = lookup[room_id]
+        rings = geometry_to_rings(room.geometry)
+        if not rings:
+            continue
+        color = palette[idx % len(palette)]
+        for ring_index, ring in enumerate(rings):
+            points = []
+            for x, y in ring:
+                cx, cy = world_to_canvas(x, y, transform)
+                points.append({"x": cx, "y": cy})
+            if not points:
+                continue
+            objects.append(
+                {
+                    "type": "polygon",
+                    "fill": "rgba(0,0,0,0)",
+                    "stroke": color,
+                    "strokeWidth": 2,
+                    "points": points,
+                    "data": {"room_id": room_id, "ring_index": ring_index},
+                    "selectable": True,
+                }
+            )
+    return {"objects": objects}
+
+
+def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> Optional[List[List[float]]]:
+    if obj.get("type") != "polygon":
+        return None
+    points = obj.get("points")
+    if (not isinstance(points, list) or not points) and isinstance(obj.get("path"), list):
+        extracted: List[Dict[str, float]] = []
+        for command in obj.get("path"):
+            if (
+                isinstance(command, list)
+                and len(command) >= 3
+                and command[0] in {"M", "L"}
+                and isinstance(command[1], (int, float))
+                and isinstance(command[2], (int, float))
+            ):
+                extracted.append({"x": float(command[1]), "y": float(command[2])})
+        points = extracted
+    if not isinstance(points, list) or not points:
+        return None
+    ring: List[List[float]] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        px = point.get("x")
+        py = point.get("y")
+        if isinstance(px, (int, float)) and isinstance(py, (int, float)):
+            x, y = canvas_to_world(float(px), float(py), transform)
+            ring.append([x, y])
+    if len(ring) < 3:
+        return None
+    # Ensure polygon is closed
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    return ring
+
+
+def update_geometries_from_canvas(data: Dict[str, Any], lookup: Dict[str, "ParsedRoom"], transform: Dict[str, float]) -> None:
+    if not data:
+        return
+    objects = data.get("objects")
+    if not isinstance(objects, list):
+        return
+    updated: Dict[str, List[List[List[float]]]] = {}
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        payload = obj.get("data")
+        if not isinstance(payload, dict):
+            continue
+        room_id = payload.get("room_id")
+        if not room_id or room_id not in lookup:
+            continue
+        ring = canvas_object_to_ring(obj, transform)
+        if not ring:
+            continue
+        updated.setdefault(room_id, []).append(ring)
+    for room_id, rings in updated.items():
+        if not rings:
+            continue
+        geometry: Dict[str, Any]
+        if len(rings) == 1:
+            geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+        else:
+            geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+        lookup[room_id].geometry = geometry
+
 def parse_rooms(payload: Any) -> Tuple[List[ParsedRoom], str]:
+    if is_geojson_payload(payload):
+        return parse_geojson_rooms(payload)
     rooms: List[ParsedRoom] = []
     room_list, path = find_room_list(payload)
     if not room_list:
@@ -260,6 +478,77 @@ def parse_rooms(payload: Any) -> Tuple[List[ParsedRoom], str]:
     return rooms, message
 
 
+def parse_geojson_rooms(payload: Dict[str, Any]) -> Tuple[List[ParsedRoom], str]:
+    if payload.get("type") == "FeatureCollection":
+        features = payload.get("features", [])
+    elif payload.get("type") == "Feature":
+        features = [payload]
+    else:
+        features = []
+    rooms: List[ParsedRoom] = []
+    message = ""
+    used_ids: Dict[str, int] = {}
+    for index, feature in enumerate(features, start=1):
+        if not isinstance(feature, dict):
+            continue
+        geometry = feature.get("geometry")
+        if not isinstance(geometry, dict):
+            continue
+        g_type = geometry.get("type")
+        if g_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        coords = geometry.get("coordinates")
+        rings = geometry_to_rings({"type": g_type, "coordinates": coords})
+        if not rings:
+            continue
+        properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+        room_identifier = coalesce(
+            [
+                properties.get("room_id"),
+                properties.get("roomId"),
+                properties.get("id"),
+                properties.get("guid"),
+                properties.get("name"),
+                feature.get("id"),
+            ],
+            default=f"room-{index}",
+        )
+        base_identifier = room_identifier
+        counter = used_ids.get(base_identifier, 0)
+        if counter:
+            room_identifier = f"{base_identifier}-{counter+1}"
+        used_ids[base_identifier] = counter + 1
+        source_name = coalesce(
+            [
+                properties.get("name"),
+                properties.get("label"),
+                properties.get("displayName"),
+            ]
+        )
+        normalized_geometry: Dict[str, Any]
+        if len(rings) == 1:
+            normalized_geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+        else:
+            normalized_geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+        attributes = {
+            "properties": properties,
+            "feature_id": feature.get("id"),
+        }
+        rooms.append(
+            ParsedRoom(
+                room_id=str(room_identifier),
+                source_name=str(source_name) if source_name else "",
+                geometry=normalized_geometry,
+                attributes=attributes,
+            )
+        )
+    if not rooms:
+        message = "GeoJSON did not contain any polygon or multipolygon features."
+    else:
+        message = "Parsed GeoJSON features"
+    return rooms, message
+
+
 def build_rooms_dataframe(rooms: List[ParsedRoom]) -> pd.DataFrame:
     data = []
     for room in rooms:
@@ -278,6 +567,32 @@ def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     """Serialize a DataFrame to UTF-8 encoded CSV bytes suitable for download."""
 
     return df.to_csv(index=False).encode("utf-8")
+
+
+def room_lookup_to_geojson(lookup: Dict[str, ParsedRoom]) -> Dict[str, Any]:
+    features: List[Dict[str, Any]] = []
+    for room in lookup.values():
+        geometry = room.geometry
+        if not isinstance(geometry, dict):
+            continue
+        properties: Dict[str, Any] = {}
+        if isinstance(room.attributes, dict):
+            if "properties" in room.attributes and isinstance(room.attributes["properties"], dict):
+                properties = dict(room.attributes["properties"])
+            else:
+                properties = dict(room.attributes)
+        properties.setdefault("room_id", room.room_id)
+        if room.source_name:
+            properties.setdefault("name", room.source_name)
+        features.append(
+            {
+                "type": "Feature",
+                "id": room.attributes.get("feature_id") if isinstance(room.attributes, dict) else room.room_id,
+                "properties": properties,
+                "geometry": geometry,
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
 
 
 def save_floorplan_to_db(name: str, filename: str, df: pd.DataFrame, lookup: Dict[str, ParsedRoom]) -> int:
@@ -365,10 +680,13 @@ def load_rooms_for_floorplan(floorplan_id: int) -> pd.DataFrame:
 
 st.title("Floorplan Room Manager")
 st.caption(
-    "Upload a floorplan JSON file, name rooms, assign departments, and store the results in a SQLite database."
+    "Upload a floorplan JSON or GeoJSON file, name rooms, assign departments, and store the results in a SQLite database."
 )
+st.caption("GeoJSON uploads should contain only geometry data – labels such as room numbers can be added later inside the app.")
 
-uploaded = st.file_uploader("Upload floorplan JSON", type=["json"], accept_multiple_files=False)
+uploaded = st.file_uploader(
+    "Upload floorplan JSON/GeoJSON", type=["json", "geojson"], accept_multiple_files=False
+)
 if uploaded is not None:
     try:
         payload = json.loads(uploaded.read().decode("utf-8"))
@@ -386,6 +704,7 @@ if uploaded is not None:
             st.session_state.parse_message = message
             st.session_state.rooms_df = None
             st.session_state.room_lookup = {}
+            st.session_state.geometry_transform = None
             if image_bytes is None:
                 st.session_state.floorplan_image_bytes = None
                 st.session_state.floorplan_image_meta = ""
@@ -393,6 +712,7 @@ if uploaded is not None:
         else:
             st.session_state.rooms_df = build_rooms_dataframe(rooms)
             st.session_state.room_lookup = {room.room_id: room for room in rooms}
+            st.session_state.geometry_transform = build_geometry_transform(st.session_state.room_lookup)
             default_name = Path(uploaded.name).stem
             st.session_state.floorplan_name = default_name
             st.session_state.uploaded_filename = uploaded.name
@@ -413,6 +733,43 @@ if st.session_state.floorplan_image_bytes is not None:
 
 if st.session_state.rooms_df is None or st.session_state.rooms_df.empty:
     st.stop()
+
+transform = build_geometry_transform(st.session_state.room_lookup)
+if transform:
+    st.session_state.geometry_transform = transform
+    st.subheader("Floorplan geometry editor")
+    st.caption(
+        "Select a room outline on the canvas and use the transform handles to drag walls. "
+        "Use the toolbar to switch between move, scale, and vertex adjustment modes."
+    )
+    initial_drawing = build_canvas_initial_drawing(st.session_state.room_lookup, transform)
+    canvas_result = st_canvas(
+        fill_color="rgba(0, 0, 0, 0)",
+        stroke_width=2,
+        background_color="#f8f9fa",
+        width=int(transform["canvas_width"]),
+        height=int(transform["canvas_height"]),
+        drawing_mode="transform",
+        initial_drawing=initial_drawing,
+        display_toolbar=True,
+        update_streamlit=True,
+        key="floorplan_canvas",
+    )
+    if canvas_result.json_data:
+        update_geometries_from_canvas(canvas_result.json_data, st.session_state.room_lookup, transform)
+        # Recompute transform for the next rerun to keep the canvas centered
+        st.session_state.geometry_transform = build_geometry_transform(st.session_state.room_lookup)
+    geojson_bytes = json.dumps(room_lookup_to_geojson(st.session_state.room_lookup), indent=2).encode("utf-8")
+    st.download_button(
+        "Download edited floorplan (GeoJSON)",
+        geojson_bytes,
+        file_name=f"{st.session_state.floorplan_name or 'floorplan'}_edited.geojson",
+        mime="application/geo+json",
+    )
+else:
+    st.info(
+        "No geometric shapes detected in the upload. Upload a GeoJSON file with polygon coordinates to enable drag-and-drop editing."
+    )
 
 st.subheader("Room details")
 
