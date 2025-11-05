@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -41,6 +41,7 @@ def init_state() -> None:
     st.session_state.setdefault("dept_room_select", [])
     st.session_state.setdefault("clear_dept_room_select", False)
     st.session_state.setdefault("geometry_transform", None)
+    st.session_state.setdefault("last_vertex_move", None)
 
 
 init_state()
@@ -322,6 +323,7 @@ def canvas_to_world(cx: float, cy: float, transform: Dict[str, float]) -> Tuple[
 
 def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dict[str, float]) -> Dict[str, Any]:
     objects: List[Dict[str, Any]] = []
+    handles: List[Dict[str, Any]] = []
     palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
     room_ids = sorted(lookup.keys())
     for idx, room_id in enumerate(room_ids):
@@ -331,24 +333,68 @@ def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dic
             continue
         color = palette[idx % len(palette)]
         for ring_index, ring in enumerate(rings):
-            points = []
+            raw_points: List[Tuple[float, float]] = []
             for x, y in ring:
-                cx, cy = world_to_canvas(x, y, transform)
-                points.append({"x": cx, "y": cy})
-            if not points:
+                raw_points.append((x, y))
+            if not raw_points:
                 continue
+            # Fabric polygons expect unique vertices; skip the final closing point
+            if len(raw_points) > 1 and raw_points[0] == raw_points[-1]:
+                raw_points = raw_points[:-1]
+
+            polygon_points: List[Dict[str, float]] = []
+            canvas_vertices: List[Tuple[float, float]] = []
+            for x, y in raw_points:
+                cx, cy = world_to_canvas(x, y, transform)
+                polygon_points.append({"x": cx, "y": cy})
+                canvas_vertices.append((cx, cy))
+            if not polygon_points:
+                continue
+
             objects.append(
                 {
                     "type": "polygon",
                     "fill": "rgba(0,0,0,0)",
                     "stroke": color,
                     "strokeWidth": 2,
-                    "points": points,
-                    "data": {"room_id": room_id, "ring_index": ring_index},
-                    "selectable": True,
+                    "points": polygon_points,
+                    "data": {"room_id": room_id, "ring_index": ring_index, "kind": "polygon"},
+                    "selectable": False,
+                    "evented": False,
+                    "hoverCursor": "default",
                 }
             )
-    return {"objects": objects}
+
+            for vertex_index, (cx, cy) in enumerate(canvas_vertices):
+                handles.append(
+                    {
+                        "type": "circle",
+                        "radius": 6,
+                        "fill": color,
+                        "stroke": "#ffffff",
+                        "strokeWidth": 2,
+                        "left": cx,
+                        "top": cy,
+                        "originX": "center",
+                        "originY": "center",
+                        "opacity": 0.9,
+                        "selectable": True,
+                        "hasBorders": False,
+                        "hasControls": False,
+                        "lockScalingX": True,
+                        "lockScalingY": True,
+                        "lockRotation": True,
+                        "hoverCursor": "move",
+                        "data": {
+                            "room_id": room_id,
+                            "ring_index": ring_index,
+                            "vertex_index": vertex_index,
+                            "vertex_count": len(canvas_vertices),
+                            "kind": "vertex",
+                        },
+                    }
+                )
+    return {"objects": objects + handles}
 
 
 def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> Optional[List[List[float]]]:
@@ -386,13 +432,34 @@ def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> O
     return ring
 
 
-def update_geometries_from_canvas(data: Dict[str, Any], lookup: Dict[str, "ParsedRoom"], transform: Dict[str, float]) -> None:
+def update_geometries_from_canvas(
+    data: Dict[str, Any],
+    lookup: Dict[str, "ParsedRoom"],
+    transform: Dict[str, float],
+) -> Optional[Dict[str, Any]]:
     if not data:
-        return
+        return None
     objects = data.get("objects")
     if not isinstance(objects, list):
-        return
+        return None
     updated: Dict[str, List[List[List[float]]]] = {}
+    handled_rings: Set[Tuple[str, int]] = set()
+
+    previous_positions: Dict[Tuple[str, int, int], Tuple[float, float]] = {}
+    for room_id, room in lookup.items():
+        rings = geometry_to_rings(room.geometry)
+        for ring_index, ring in enumerate(rings):
+            if len(ring) > 1 and ring[0] == ring[-1]:
+                ring_iter = ring[:-1]
+            else:
+                ring_iter = ring
+            for vertex_index, (x, y) in enumerate(ring_iter):
+                previous_positions[(room_id, ring_index, vertex_index)] = (x, y)
+
+    vertex_positions: Dict[Tuple[str, int], Dict[int, Tuple[float, float]]] = {}
+    vertex_counts: Dict[Tuple[str, int], int] = {}
+    movement_info: Optional[Dict[str, Any]] = None
+
     for obj in objects:
         if not isinstance(obj, dict):
             continue
@@ -402,10 +469,66 @@ def update_geometries_from_canvas(data: Dict[str, Any], lookup: Dict[str, "Parse
         room_id = payload.get("room_id")
         if not room_id or room_id not in lookup:
             continue
-        ring = canvas_object_to_ring(obj, transform)
-        if not ring:
+        if payload.get("kind") == "vertex":
+            ring_index = payload.get("ring_index")
+            vertex_index = payload.get("vertex_index")
+            vertex_count = payload.get("vertex_count")
+            if not isinstance(ring_index, int) or not isinstance(vertex_index, int):
+                continue
+            center_x = obj.get("left")
+            center_y = obj.get("top")
+            if not isinstance(center_x, (int, float)) or not isinstance(center_y, (int, float)):
+                continue
+            cx = float(center_x)
+            cy = float(center_y)
+            x, y = canvas_to_world(cx, cy, transform)
+            key = (room_id, ring_index)
+            vertex_positions.setdefault(key, {})[vertex_index] = (x, y)
+            if isinstance(vertex_count, int):
+                vertex_counts[key] = vertex_count
+        else:
+            ring = canvas_object_to_ring(obj, transform)
+            if not ring:
+                continue
+            ring_index = payload.get("ring_index")
+            if isinstance(ring_index, int):
+                key = (room_id, ring_index)
+                if key in handled_rings:
+                    continue
+                handled_rings.add(key)
+            updated.setdefault(room_id, []).append(ring)
+
+    for key, vertices in vertex_positions.items():
+        room_id, ring_index = key
+        count = vertex_counts.get(key, len(vertices))
+        ordered: List[List[float]] = []
+        for vertex_idx in range(count):
+            if vertex_idx not in vertices:
+                prev = previous_positions.get((room_id, ring_index, vertex_idx))
+                if prev:
+                    ordered.append([prev[0], prev[1]])
+                continue
+            x, y = vertices[vertex_idx]
+            ordered.append([x, y])
+            prev = previous_positions.get((room_id, ring_index, vertex_idx))
+            if prev and (abs(prev[0] - x) > 1e-9 or abs(prev[1] - y) > 1e-9):
+                canvas_x, canvas_y = world_to_canvas(x, y, transform)
+                prev_canvas_x, prev_canvas_y = world_to_canvas(prev[0], prev[1], transform)
+                movement_info = {
+                    "room_id": room_id,
+                    "ring_index": ring_index,
+                    "vertex_index": vertex_idx,
+                    "from": {"x": prev[0], "y": prev[1], "cx": prev_canvas_x, "cy": prev_canvas_y},
+                    "to": {"x": x, "y": y, "cx": canvas_x, "cy": canvas_y},
+                    "delta": {"x": x - prev[0], "y": y - prev[1], "cx": canvas_x - prev_canvas_x, "cy": canvas_y - prev_canvas_y},
+                }
+        if len(ordered) < 3:
             continue
-        updated.setdefault(room_id, []).append(ring)
+        if ordered[0] != ordered[-1]:
+            ordered.append(ordered[0])
+        updated.setdefault(room_id, []).append(ordered)
+        handled_rings.add(key)
+
     for room_id, rings in updated.items():
         if not rings:
             continue
@@ -415,6 +538,7 @@ def update_geometries_from_canvas(data: Dict[str, Any], lookup: Dict[str, "Parse
         else:
             geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
         lookup[room_id].geometry = geometry
+    return movement_info
 
 def parse_rooms(payload: Any) -> Tuple[List[ParsedRoom], str]:
     if is_geojson_payload(payload):
@@ -739,8 +863,8 @@ if transform:
     st.session_state.geometry_transform = transform
     st.subheader("Floorplan geometry editor")
     st.caption(
-        "Select a room outline on the canvas and use the transform handles to drag walls. "
-        "Use the toolbar to switch between move, scale, and vertex adjustment modes."
+        "Use the circular handles at polygon corners to drag vertices to new positions. "
+        "The most recent movement displays the delta and absolute coordinates below."
     )
     initial_drawing = build_canvas_initial_drawing(st.session_state.room_lookup, transform)
     canvas_result = st_canvas(
@@ -756,9 +880,31 @@ if transform:
         key="floorplan_canvas",
     )
     if canvas_result.json_data:
-        update_geometries_from_canvas(canvas_result.json_data, st.session_state.room_lookup, transform)
+        movement = update_geometries_from_canvas(canvas_result.json_data, st.session_state.room_lookup, transform)
+        if movement:
+            st.session_state.last_vertex_move = movement
         # Recompute transform for the next rerun to keep the canvas centered
         st.session_state.geometry_transform = build_geometry_transform(st.session_state.room_lookup)
+    if st.session_state.last_vertex_move:
+        move = st.session_state.last_vertex_move
+        room_id = move.get("room_id", "?")
+        vertex_index = move.get("vertex_index", 0) + 1
+        delta = move.get("delta", {})
+        target = move.get("to", {})
+        delta_world_x = float(delta.get("x", 0.0))
+        delta_world_y = float(delta.get("y", 0.0))
+        delta_canvas_x = float(delta.get("cx", 0.0))
+        delta_canvas_y = float(delta.get("cy", 0.0))
+        target_world_x = float(target.get("x", 0.0))
+        target_world_y = float(target.get("y", 0.0))
+        target_canvas_x = float(target.get("cx", 0.0))
+        target_canvas_y = float(target.get("cy", 0.0))
+        st.info(
+            f"Room `{room_id}` vertex {vertex_index}: Δx={delta_world_x:.2f}, Δy={delta_world_y:.2f} "
+            f"(world) → x={target_world_x:.2f}, y={target_world_y:.2f}. "
+            f"Canvas shift Δx={delta_canvas_x:.1f}px, Δy={delta_canvas_y:.1f}px → "
+            f"x={target_canvas_x:.1f}px, y={target_canvas_y:.1f}px."
+        )
     geojson_bytes = json.dumps(room_lookup_to_geojson(st.session_state.room_lookup), indent=2).encode("utf-8")
     st.download_button(
         "Download edited floorplan (GeoJSON)",
