@@ -234,6 +234,23 @@ def normalize_polygon(coords: Any) -> Optional[List[List[float]]]:
     return None
 
 
+def normalize_polyline(coords: Any) -> Optional[List[List[float]]]:
+    """Return a list of [x, y] pairs for a polyline or line string."""
+
+    if not isinstance(coords, list) or not coords:
+        return None
+    points: List[List[float]] = []
+    for pair in coords:
+        if (
+            isinstance(pair, (list, tuple))
+            and len(pair) >= 2
+            and isinstance(pair[0], (int, float))
+            and isinstance(pair[1], (int, float))
+        ):
+            points.append([float(pair[0]), float(pair[1])])
+    return points or None
+
+
 def geometry_to_rings(geometry: Any) -> List[List[List[float]]]:
     """Return a list of polygon rings for the provided geometry."""
 
@@ -261,10 +278,41 @@ def geometry_to_rings(geometry: Any) -> List[List[List[float]]]:
     return []
 
 
+def geometry_to_paths(geometry: Any) -> List[List[List[float]]]:
+    """Return polyline paths for LineString-like geometries."""
+
+    if geometry is None:
+        return []
+    if isinstance(geometry, dict):
+        g_type = geometry.get("type")
+        coords = geometry.get("coordinates")
+        if g_type == "LineString":
+            path = normalize_polyline(coords)
+            return [path] if path else []
+        if g_type == "MultiLineString" and isinstance(coords, list):
+            paths: List[List[List[float]]] = []
+            for line in coords:
+                path = normalize_polyline(line)
+                if path:
+                    paths.append(path)
+            return paths
+        if isinstance(coords, dict):
+            return geometry_to_paths(coords)
+    if isinstance(geometry, (list, tuple)):
+        path = normalize_polyline(list(geometry))
+        return [path] if path else []
+    return []
+
+
 def iter_geometry_points(lookup: Dict[str, "ParsedRoom"]) -> Iterable[Tuple[float, float]]:
     for room in lookup.values():
-        for ring in geometry_to_rings(room.geometry):
+        rings = geometry_to_rings(room.geometry)
+        paths = geometry_to_paths(room.geometry)
+        for ring in rings:
             for x, y in ring:
+                yield x, y
+        for path in paths:
+            for x, y in path:
                 yield x, y
 
 
@@ -330,7 +378,8 @@ def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dic
     for idx, room_id in enumerate(room_ids):
         room = lookup[room_id]
         rings = geometry_to_rings(room.geometry)
-        if not rings:
+        paths = geometry_to_paths(room.geometry)
+        if not rings and not paths:
             continue
         color = palette[idx % len(palette)]
         for ring_index, ring in enumerate(rings):
@@ -359,7 +408,7 @@ def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dic
                     "stroke": color,
                     "strokeWidth": 2,
                     "points": polygon_points,
-                    "data": {"room_id": room_id, "ring_index": ring_index, "kind": "polygon"},
+                    "data": {"room_id": room_id, "ring_index": ring_index, "kind": "polygon", "shape": "polygon"},
                     "selectable": False,
                     "evented": False,
                     "hoverCursor": "default",
@@ -392,6 +441,63 @@ def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dic
                             "vertex_index": vertex_index,
                             "vertex_count": len(canvas_vertices),
                             "kind": "vertex",
+                            "shape": "polygon",
+                        },
+                    }
+                )
+        for path_index, path in enumerate(paths):
+            raw_points: List[Tuple[float, float]] = []
+            for x, y in path:
+                raw_points.append((x, y))
+            if len(raw_points) < 2:
+                continue
+
+            polyline_points: List[Dict[str, float]] = []
+            canvas_vertices: List[Tuple[float, float]] = []
+            for x, y in raw_points:
+                cx, cy = world_to_canvas(x, y, transform)
+                polyline_points.append({"x": cx, "y": cy})
+                canvas_vertices.append((cx, cy))
+            objects.append(
+                {
+                    "type": "polyline",
+                    "points": polyline_points,
+                    "stroke": color,
+                    "fill": None,
+                    "strokeWidth": 2,
+                    "data": {"room_id": room_id, "path_index": path_index, "kind": "polyline", "shape": "polyline"},
+                    "selectable": False,
+                    "evented": False,
+                    "hoverCursor": "default",
+                }
+            )
+            for vertex_index, (cx, cy) in enumerate(canvas_vertices):
+                handles.append(
+                    {
+                        "type": "circle",
+                        "radius": 6,
+                        "fill": color,
+                        "stroke": "#ffffff",
+                        "strokeWidth": 2,
+                        "left": cx,
+                        "top": cy,
+                        "originX": "center",
+                        "originY": "center",
+                        "opacity": 0.9,
+                        "selectable": True,
+                        "hasBorders": False,
+                        "hasControls": False,
+                        "lockScalingX": True,
+                        "lockScalingY": True,
+                        "lockRotation": True,
+                        "hoverCursor": "move",
+                        "data": {
+                            "room_id": room_id,
+                            "path_index": path_index,
+                            "vertex_index": vertex_index,
+                            "vertex_count": len(canvas_vertices),
+                            "kind": "vertex",
+                            "shape": "polyline",
                         },
                     }
                 )
@@ -433,6 +539,38 @@ def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> O
     return ring
 
 
+def canvas_object_to_path(obj: Dict[str, Any], transform: Dict[str, float]) -> Optional[List[List[float]]]:
+    if obj.get("type") not in {"polyline", "line"}:
+        return None
+    points = obj.get("points")
+    if (not isinstance(points, list) or not points) and isinstance(obj.get("path"), list):
+        extracted: List[Dict[str, float]] = []
+        for command in obj.get("path"):
+            if (
+                isinstance(command, list)
+                and len(command) >= 3
+                and command[0] in {"M", "L"}
+                and isinstance(command[1], (int, float))
+                and isinstance(command[2], (int, float))
+            ):
+                extracted.append({"x": float(command[1]), "y": float(command[2])})
+        points = extracted
+    if not isinstance(points, list) or len(points) < 2:
+        return None
+    path: List[List[float]] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        px = point.get("x")
+        py = point.get("y")
+        if isinstance(px, (int, float)) and isinstance(py, (int, float)):
+            x, y = canvas_to_world(float(px), float(py), transform)
+            path.append([x, y])
+    if len(path) < 2:
+        return None
+    return path
+
+
 # Helpers -----------------------------------------------------------------
 
 
@@ -459,10 +597,11 @@ def update_geometries_from_canvas(
     objects = data.get("objects")
     if not isinstance(objects, list):
         return None
-    updated: Dict[str, List[List[List[float]]]] = {}
-    handled_rings: Set[Tuple[str, int]] = set()
+    updated_polygons: Dict[str, List[List[List[float]]]] = {}
+    updated_polylines: Dict[str, List[List[List[float]]]] = {}
+    handled_components: Set[Tuple[str, str, int]] = set()
 
-    previous_positions: Dict[Tuple[str, int, int], Tuple[float, float]] = {}
+    previous_positions: Dict[Tuple[str, str, int, int], Tuple[float, float]] = {}
     for room_id, room in lookup.items():
         rings = geometry_to_rings(room.geometry)
         for ring_index, ring in enumerate(rings):
@@ -471,10 +610,14 @@ def update_geometries_from_canvas(
             else:
                 ring_iter = ring
             for vertex_index, (x, y) in enumerate(ring_iter):
-                previous_positions[(room_id, ring_index, vertex_index)] = (x, y)
+                previous_positions[("polygon", room_id, ring_index, vertex_index)] = (x, y)
+        paths = geometry_to_paths(room.geometry)
+        for path_index, path in enumerate(paths):
+            for vertex_index, (x, y) in enumerate(path):
+                previous_positions[("polyline", room_id, path_index, vertex_index)] = (x, y)
 
-    vertex_positions: Dict[Tuple[str, int], Dict[int, Tuple[float, float]]] = {}
-    vertex_counts: Dict[Tuple[str, int], int] = {}
+    vertex_positions: Dict[Tuple[str, str, int], Dict[int, Tuple[float, float]]] = {}
+    vertex_counts: Dict[Tuple[str, str, int], int] = {}
     movement_info: Optional[Dict[str, Any]] = None
 
     for obj in objects:
@@ -486,11 +629,16 @@ def update_geometries_from_canvas(
         room_id = payload.get("room_id")
         if not room_id or room_id not in lookup:
             continue
-        if payload.get("kind") == "vertex":
-            ring_index = _coerce_non_negative_int(payload.get("ring_index"))
+        kind = payload.get("kind")
+        shape = payload.get("shape", "polygon")
+        if kind == "vertex":
+            if shape == "polyline":
+                component_index = _coerce_non_negative_int(payload.get("path_index"))
+            else:
+                component_index = _coerce_non_negative_int(payload.get("ring_index"))
             vertex_index = _coerce_non_negative_int(payload.get("vertex_index"))
             vertex_count = _coerce_non_negative_int(payload.get("vertex_count"))
-            if ring_index is None or vertex_index is None:
+            if component_index is None or vertex_index is None:
                 continue
             center_x = obj.get("left")
             center_y = obj.get("top")
@@ -499,54 +647,72 @@ def update_geometries_from_canvas(
             cx = float(center_x)
             cy = float(center_y)
             x, y = canvas_to_world(cx, cy, transform)
-            key = (room_id, ring_index)
+            key = (shape, room_id, component_index)
             vertex_positions.setdefault(key, {})[vertex_index] = (x, y)
             if vertex_count is not None:
                 vertex_counts[key] = vertex_count
-        else:
+        elif kind == "polygon":
             ring = canvas_object_to_ring(obj, transform)
             if not ring:
                 continue
             ring_index = _coerce_non_negative_int(payload.get("ring_index"))
             if ring_index is not None:
-                key = (room_id, ring_index)
-                if key in handled_rings:
+                key = ("polygon", room_id, ring_index)
+                if key in handled_components:
                     continue
-                handled_rings.add(key)
-            updated.setdefault(room_id, []).append(ring)
+                handled_components.add(key)
+            updated_polygons.setdefault(room_id, []).append(ring)
+        elif kind == "polyline":
+            path = canvas_object_to_path(obj, transform)
+            if not path:
+                continue
+            path_index = _coerce_non_negative_int(payload.get("path_index"))
+            if path_index is not None:
+                key = ("polyline", room_id, path_index)
+                if key in handled_components:
+                    continue
+                handled_components.add(key)
+            updated_polylines.setdefault(room_id, []).append(path)
 
     for key, vertices in vertex_positions.items():
-        room_id, ring_index = key
+        shape, room_id, component_index = key
         count = vertex_counts.get(key, len(vertices))
         ordered: List[List[float]] = []
         for vertex_idx in range(count):
             if vertex_idx not in vertices:
-                prev = previous_positions.get((room_id, ring_index, vertex_idx))
+                prev = previous_positions.get((shape, room_id, component_index, vertex_idx))
                 if prev:
                     ordered.append([prev[0], prev[1]])
                 continue
             x, y = vertices[vertex_idx]
             ordered.append([x, y])
-            prev = previous_positions.get((room_id, ring_index, vertex_idx))
+            prev = previous_positions.get((shape, room_id, component_index, vertex_idx))
             if prev and (abs(prev[0] - x) > 1e-9 or abs(prev[1] - y) > 1e-9):
                 canvas_x, canvas_y = world_to_canvas(x, y, transform)
                 prev_canvas_x, prev_canvas_y = world_to_canvas(prev[0], prev[1], transform)
                 movement_info = {
                     "room_id": room_id,
-                    "ring_index": ring_index,
+                    "ring_index": component_index,
                     "vertex_index": vertex_idx,
+                    "shape": shape,
                     "from": {"x": prev[0], "y": prev[1], "cx": prev_canvas_x, "cy": prev_canvas_y},
                     "to": {"x": x, "y": y, "cx": canvas_x, "cy": canvas_y},
                     "delta": {"x": x - prev[0], "y": y - prev[1], "cx": canvas_x - prev_canvas_x, "cy": canvas_y - prev_canvas_y},
                 }
-        if len(ordered) < 3:
-            continue
-        if ordered[0] != ordered[-1]:
-            ordered.append(ordered[0])
-        updated.setdefault(room_id, []).append(ordered)
-        handled_rings.add(key)
+        if shape == "polygon":
+            if len(ordered) < 3:
+                continue
+            if ordered[0] != ordered[-1]:
+                ordered.append(ordered[0])
+            updated_polygons.setdefault(room_id, []).append(ordered)
+            handled_components.add(key)
+        else:
+            if len(ordered) < 2:
+                continue
+            updated_polylines.setdefault(room_id, []).append(ordered)
+            handled_components.add(key)
 
-    for room_id, rings in updated.items():
+    for room_id, rings in updated_polygons.items():
         if not rings:
             continue
         geometry: Dict[str, Any]
@@ -554,6 +720,16 @@ def update_geometries_from_canvas(
             geometry = {"type": "Polygon", "coordinates": [rings[0]]}
         else:
             geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+        lookup[room_id].geometry = geometry
+
+    for room_id, paths in updated_polylines.items():
+        if not paths:
+            continue
+        geometry: Dict[str, Any]
+        if len(paths) == 1:
+            geometry = {"type": "LineString", "coordinates": paths[0]}
+        else:
+            geometry = {"type": "MultiLineString", "coordinates": paths}
         lookup[room_id].geometry = geometry
     return movement_info
 
@@ -636,12 +812,19 @@ def parse_geojson_rooms(payload: Dict[str, Any]) -> Tuple[List[ParsedRoom], str]
         if not isinstance(geometry, dict):
             continue
         g_type = geometry.get("type")
-        if g_type not in {"Polygon", "MultiPolygon"}:
+        if g_type not in {"Polygon", "MultiPolygon", "LineString", "MultiLineString"}:
             continue
         coords = geometry.get("coordinates")
-        rings = geometry_to_rings({"type": g_type, "coordinates": coords})
-        if not rings:
-            continue
+        rings: List[List[List[float]]] = []
+        paths: List[List[List[float]]] = []
+        if g_type in {"Polygon", "MultiPolygon"}:
+            rings = geometry_to_rings({"type": g_type, "coordinates": coords})
+            if not rings:
+                continue
+        else:
+            paths = geometry_to_paths({"type": g_type, "coordinates": coords})
+            if not paths:
+                continue
         properties = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
         room_identifier = coalesce(
             [
@@ -667,10 +850,16 @@ def parse_geojson_rooms(payload: Dict[str, Any]) -> Tuple[List[ParsedRoom], str]
             ]
         )
         normalized_geometry: Dict[str, Any]
-        if len(rings) == 1:
-            normalized_geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+        if g_type in {"Polygon", "MultiPolygon"}:
+            if len(rings) == 1:
+                normalized_geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+            else:
+                normalized_geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
         else:
-            normalized_geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+            if len(paths) == 1:
+                normalized_geometry = {"type": "LineString", "coordinates": paths[0]}
+            else:
+                normalized_geometry = {"type": "MultiLineString", "coordinates": paths}
         attributes = {
             "properties": properties,
             "feature_id": feature.get("id"),
@@ -684,7 +873,7 @@ def parse_geojson_rooms(payload: Dict[str, Any]) -> Tuple[List[ParsedRoom], str]
             )
         )
     if not rooms:
-        message = "GeoJSON did not contain any polygon or multipolygon features."
+        message = "GeoJSON did not contain any polygon, multipolygon, or line features."
     else:
         message = "Parsed GeoJSON features"
     return rooms, message
@@ -906,6 +1095,7 @@ if transform:
         move = st.session_state.last_vertex_move
         room_id = move.get("room_id", "?")
         vertex_index = move.get("vertex_index", 0) + 1
+        shape_kind = move.get("shape", "polygon")
         delta = move.get("delta", {})
         target = move.get("to", {})
         delta_world_x = float(delta.get("x", 0.0))
@@ -916,8 +1106,12 @@ if transform:
         target_world_y = float(target.get("y", 0.0))
         target_canvas_x = float(target.get("cx", 0.0))
         target_canvas_y = float(target.get("cy", 0.0))
+        if shape_kind == "polyline":
+            shape_label = "line node"
+        else:
+            shape_label = "vertex"
         st.info(
-            f"Room `{room_id}` vertex {vertex_index}: Δx={delta_world_x:.2f}, Δy={delta_world_y:.2f} "
+            f"Room `{room_id}` {shape_label} {vertex_index}: Δx={delta_world_x:.2f}, Δy={delta_world_y:.2f} "
             f"(world) → x={target_world_x:.2f}, y={target_world_y:.2f}. "
             f"Canvas shift Δx={delta_canvas_x:.1f}px, Δy={delta_canvas_y:.1f}px → "
             f"x={target_canvas_x:.1f}px, y={target_canvas_y:.1f}px."
