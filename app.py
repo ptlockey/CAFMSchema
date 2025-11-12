@@ -58,6 +58,8 @@ def init_state() -> None:
     st.session_state.setdefault("geometry_transform", None)
     st.session_state.setdefault("selected_wall_segment", None)
     st.session_state.setdefault("geometry_editor_message", "")
+    st.session_state.setdefault("wall_editor_tool", "Select walls")
+    st.session_state.setdefault("wall_editor_zoom", 100)
 
 
 init_state()
@@ -319,10 +321,35 @@ def geometry_to_paths(geometry: Any) -> List[List[List[float]]]:
     return []
 
 
+def compute_zoomed_axis_ranges(
+    transform: Dict[str, float],
+    zoom_factor: float,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Return axis ranges centered on the geometry, adjusted by zoom."""
+
+    zoom = max(zoom_factor, 1e-3)
+    min_x = transform["min_x"]
+    max_x = transform["max_x"]
+    min_y = transform["min_y"]
+    max_y = transform["max_y"]
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+    width = max(max_x - min_x, 1e-6) / zoom
+    height = max(max_y - min_y, 1e-6) / zoom
+    half_w = width / 2
+    half_h = height / 2
+    x_range = (center_x - half_w, center_x + half_w)
+    y_min = center_y - half_h
+    y_max = center_y + half_h
+    y_range = (y_max, y_min)
+    return x_range, y_range
+
+
 def build_wall_preview_figure(
     lookup: Dict[str, "ParsedRoom"],
     transform: Dict[str, float],
     wall_width: float,
+    zoom_factor: float,
 ) -> Optional[go.Figure]:
     """Return a Plotly figure showing polygon edges and polylines as walls."""
 
@@ -365,13 +392,10 @@ def build_wall_preview_figure(
         ]
     )
 
-    min_x = transform["min_x"]
-    max_x = transform["max_x"]
-    min_y = transform["min_y"]
-    max_y = transform["max_y"]
+    x_range, y_range = compute_zoomed_axis_ranges(transform, zoom_factor)
 
     fig.update_xaxes(
-        range=[min_x, max_x],
+        range=list(x_range),
         showgrid=False,
         zeroline=False,
         showticklabels=False,
@@ -379,7 +403,7 @@ def build_wall_preview_figure(
         constrain="domain",
     )
     fig.update_yaxes(
-        range=[max_y, min_y],
+        range=list(y_range),
         showgrid=False,
         zeroline=False,
         showticklabels=False,
@@ -478,6 +502,8 @@ def build_wall_editor_figure(
     segments: Dict[str, WallSegment],
     transform: Dict[str, float],
     selected_segment_id: Optional[str] = None,
+    zoom_factor: float = 1.0,
+    dragmode: str = "select",
 ) -> go.Figure:
     fig = go.Figure()
     for seg in segments.values():
@@ -488,8 +514,9 @@ def build_wall_editor_figure(
             go.Scatter(
                 x=xs,
                 y=ys,
-                mode="lines",
+                mode="lines+markers",
                 line=dict(color="#d62728" if is_selected else "#000000", width=4 if is_selected else 1.5),
+                marker=dict(size=8, color="rgba(0,0,0,0)"),
                 hovertemplate=(
                     f"Room {seg.room_id}<br>"
                     f"{'Polygon edge' if seg.shape == 'ring' else 'Line segment'}"
@@ -499,13 +526,10 @@ def build_wall_editor_figure(
             )
         )
 
-    min_x = transform["min_x"]
-    max_x = transform["max_x"]
-    min_y = transform["min_y"]
-    max_y = transform["max_y"]
+    x_range, y_range = compute_zoomed_axis_ranges(transform, zoom_factor)
 
     fig.update_xaxes(
-        range=[min_x, max_x],
+        range=list(x_range),
         showgrid=False,
         zeroline=False,
         showticklabels=False,
@@ -513,7 +537,7 @@ def build_wall_editor_figure(
         constrain="domain",
     )
     fig.update_yaxes(
-        range=[max_y, min_y],
+        range=list(y_range),
         showgrid=False,
         zeroline=False,
         showticklabels=False,
@@ -527,6 +551,7 @@ def build_wall_editor_figure(
         margin=dict(l=20, r=20, t=20, b=20),
         showlegend=False,
         clickmode="event+select",
+        dragmode=dragmode,
     )
     return fig
 
@@ -986,9 +1011,24 @@ if transform:
         key="wall_thickness_slider",
         help="Adjust how thick the wall lines appear in the preview.",
     )
-    wall_fig = build_wall_preview_figure(st.session_state.room_lookup, transform, wall_thickness)
+    zoom_percent = st.slider(
+        "Editor zoom",
+        min_value=50,
+        max_value=300,
+        step=10,
+        format="%d%%",
+        key="wall_editor_zoom",
+        help="Zoom in to inspect details or out to see the full floorplan.",
+    )
+    zoom_factor = zoom_percent / 100.0
+    wall_fig = build_wall_preview_figure(
+        st.session_state.room_lookup,
+        transform,
+        wall_thickness,
+        zoom_factor,
+    )
     if wall_fig:
-        st.plotly_chart(wall_fig, use_container_width=True)
+        st.plotly_chart(wall_fig, use_container_width=True, config={"scrollZoom": True})
     else:
         st.info("No wall geometries available to preview.")
     st.subheader("Floorplan geometry editor")
@@ -996,6 +1036,19 @@ if transform:
         "This editor mirrors the wall preview with thin black lines. Click a wall segment to "
         "select it, then use the button below to delete it."
     )
+    tool_choice = st.radio(
+        "Editor tool",
+        options=("Select walls", "Pan", "Box zoom"),
+        key="wall_editor_tool",
+        horizontal=True,
+        help="Choose how to interact with the editor. Use 'Select walls' to pick segments.",
+    )
+    dragmode_map = {
+        "Select walls": "select",
+        "Pan": "pan",
+        "Box zoom": "zoom",
+    }
+    dragmode = dragmode_map.get(tool_choice, "select")
     if st.session_state.geometry_editor_message:
         st.success(st.session_state.geometry_editor_message)
         st.session_state.geometry_editor_message = ""
@@ -1009,7 +1062,13 @@ if transform:
     if not segments:
         st.info("No wall segments available for editing.")
     else:
-        editor_fig = build_wall_editor_figure(segments, transform, selected_segment_id)
+        editor_fig = build_wall_editor_figure(
+            segments,
+            transform,
+            selected_segment_id,
+            zoom_factor=zoom_factor,
+            dragmode=dragmode,
+        )
         events = plotly_events(
             editor_fig,
             click_event=True,
@@ -1017,6 +1076,7 @@ if transform:
             select_event=False,
             override_height=int(transform.get("canvas_height", 600)),
             key="wall_editor_events",
+            config={"scrollZoom": True},
         )
         if events:
             last_event = events[-1]
@@ -1027,8 +1087,14 @@ if transform:
                 st.session_state.selected_wall_segment = payload
                 selected_segment_id = payload
         # Rebuild the figure to show the active selection highlight
-        editor_fig = build_wall_editor_figure(segments, transform, selected_segment_id)
-        st.plotly_chart(editor_fig, use_container_width=True)
+        editor_fig = build_wall_editor_figure(
+            segments,
+            transform,
+            selected_segment_id,
+            zoom_factor=zoom_factor,
+            dragmode=dragmode,
+        )
+        st.plotly_chart(editor_fig, use_container_width=True, config={"scrollZoom": True})
 
         selected_segment = (
             segments.get(st.session_state.selected_wall_segment)
