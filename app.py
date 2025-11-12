@@ -5,15 +5,14 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from numbers import Number
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
-from streamlit_drawable_canvas import st_canvas
+from streamlit_plotly_events import plotly_events
 
 st.set_page_config(page_title="Floorplan Room Manager", layout="wide")
 
@@ -31,6 +30,20 @@ class ParsedRoom:
     attributes: Dict[str, Any]
 
 
+@dataclass
+class WallSegment:
+    """Metadata describing a single wall edge for selection/deletion."""
+
+    segment_id: str
+    room_id: str
+    shape: str  # "ring" or "path"
+    component_index: int
+    start_vertex: int
+    end_vertex: int
+    start: Tuple[float, float]
+    end: Tuple[float, float]
+
+
 def init_state() -> None:
     st.session_state.setdefault("rooms_df", None)
     st.session_state.setdefault("room_lookup", {})
@@ -43,7 +56,8 @@ def init_state() -> None:
     st.session_state.setdefault("dept_room_select", [])
     st.session_state.setdefault("clear_dept_room_select", False)
     st.session_state.setdefault("geometry_transform", None)
-    st.session_state.setdefault("last_vertex_move", None)
+    st.session_state.setdefault("selected_wall_segment", None)
+    st.session_state.setdefault("geometry_editor_message", "")
 
 
 init_state()
@@ -385,6 +399,198 @@ def build_wall_preview_figure(
     return fig
 
 
+def _collect_ring_points(ring: List[List[float]]) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for pair in ring:
+        if (
+            isinstance(pair, list)
+            and len(pair) >= 2
+            and isinstance(pair[0], (int, float))
+            and isinstance(pair[1], (int, float))
+            and math.isfinite(pair[0])
+            and math.isfinite(pair[1])
+        ):
+            points.append((float(pair[0]), float(pair[1])))
+    if len(points) < 2:
+        return []
+    if points[0] == points[-1]:
+        points = points[:-1]
+    return points
+
+
+def collect_wall_segments(lookup: Dict[str, "ParsedRoom"]) -> Dict[str, WallSegment]:
+    segments: Dict[str, WallSegment] = {}
+    for room in lookup.values():
+        rings = geometry_to_rings(room.geometry)
+        for ring_index, ring in enumerate(rings):
+            points = _collect_ring_points(ring)
+            if len(points) < 2:
+                continue
+            total = len(points)
+            for start_idx in range(total):
+                end_idx = (start_idx + 1) % total
+                start = points[start_idx]
+                end = points[end_idx]
+                segment_id = f"{room.room_id}|ring|{ring_index}|{start_idx}->{end_idx}"
+                segments[segment_id] = WallSegment(
+                    segment_id=segment_id,
+                    room_id=room.room_id,
+                    shape="ring",
+                    component_index=ring_index,
+                    start_vertex=start_idx,
+                    end_vertex=end_idx,
+                    start=start,
+                    end=end,
+                )
+        paths = geometry_to_paths(room.geometry)
+        for path_index, path in enumerate(paths):
+            points = [
+                (float(pair[0]), float(pair[1]))
+                for pair in path
+                if isinstance(pair, list)
+                and len(pair) >= 2
+                and isinstance(pair[0], (int, float))
+                and isinstance(pair[1], (int, float))
+                and math.isfinite(pair[0])
+                and math.isfinite(pair[1])
+            ]
+            if len(points) < 2:
+                continue
+            for start_idx in range(len(points) - 1):
+                end_idx = start_idx + 1
+                start = points[start_idx]
+                end = points[end_idx]
+                segment_id = f"{room.room_id}|path|{path_index}|{start_idx}->{end_idx}"
+                segments[segment_id] = WallSegment(
+                    segment_id=segment_id,
+                    room_id=room.room_id,
+                    shape="path",
+                    component_index=path_index,
+                    start_vertex=start_idx,
+                    end_vertex=end_idx,
+                    start=start,
+                    end=end,
+                )
+    return segments
+
+
+def build_wall_editor_figure(
+    segments: Dict[str, WallSegment],
+    transform: Dict[str, float],
+    selected_segment_id: Optional[str] = None,
+) -> go.Figure:
+    fig = go.Figure()
+    for seg in segments.values():
+        xs = [seg.start[0], seg.end[0]]
+        ys = [seg.start[1], seg.end[1]]
+        is_selected = seg.segment_id == selected_segment_id
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(color="#d62728" if is_selected else "#000000", width=4 if is_selected else 1.5),
+                hovertemplate=(
+                    f"Room {seg.room_id}<br>"
+                    f"{'Polygon edge' if seg.shape == 'ring' else 'Line segment'}"
+                    "<br>x₁=%{x[0]:.2f}, y₁=%{y[0]:.2f}<br>x₂=%{x[1]:.2f}, y₂=%{y[1]:.2f}<extra></extra>"
+                ),
+                customdata=[[seg.segment_id], [seg.segment_id]],
+            )
+        )
+
+    min_x = transform["min_x"]
+    max_x = transform["max_x"]
+    min_y = transform["min_y"]
+    max_y = transform["max_y"]
+
+    fig.update_xaxes(
+        range=[min_x, max_x],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        title_text="",
+        constrain="domain",
+    )
+    fig.update_yaxes(
+        range=[max_y, min_y],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        title_text="",
+        scaleanchor="x",
+        scaleratio=1,
+    )
+
+    fig.update_layout(
+        autosize=True,
+        margin=dict(l=20, r=20, t=20, b=20),
+        showlegend=False,
+        clickmode="event+select",
+    )
+    return fig
+
+
+def delete_wall_segment(segment: WallSegment, lookup: Dict[str, "ParsedRoom"]) -> bool:
+    room = lookup.get(segment.room_id)
+    if room is None:
+        return False
+    geometry = room.geometry
+    if geometry is None:
+        return False
+
+    if segment.shape == "ring":
+        rings = geometry_to_rings(geometry)
+        if not rings or segment.component_index >= len(rings):
+            return False
+        ring = _collect_ring_points(rings[segment.component_index])
+        if len(ring) < 2:
+            return False
+        total = len(ring)
+        remove_idx = segment.end_vertex % total
+        del ring[remove_idx]
+        if len(ring) < 3:
+            del rings[segment.component_index]
+        else:
+            ring.append(ring[0])
+            rings[segment.component_index] = ring
+        if not rings:
+            room.geometry = None
+        elif len(rings) == 1:
+            room.geometry = {"type": "Polygon", "coordinates": [rings[0]]}
+        else:
+            room.geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
+        return True
+
+    paths = geometry_to_paths(geometry)
+    if not paths or segment.component_index >= len(paths):
+        return False
+    path = [
+        [float(pair[0]), float(pair[1])]
+        for pair in paths[segment.component_index]
+        if isinstance(pair, list)
+        and len(pair) >= 2
+        and isinstance(pair[0], (int, float))
+        and isinstance(pair[1], (int, float))
+    ]
+    if len(path) < 2:
+        return False
+    if segment.end_vertex < len(path):
+        del path[segment.end_vertex]
+    if len(path) < 2:
+        del paths[segment.component_index]
+    else:
+        paths[segment.component_index] = path
+
+    if not paths:
+        room.geometry = None
+    elif len(paths) == 1:
+        room.geometry = {"type": "LineString", "coordinates": paths[0]}
+    else:
+        room.geometry = {"type": "MultiLineString", "coordinates": paths}
+    return True
+
+
 def iter_geometry_points(lookup: Dict[str, "ParsedRoom"]) -> Iterable[Tuple[float, float]]:
     for room in lookup.values():
         rings = geometry_to_rings(room.geometry)
@@ -435,384 +641,6 @@ def build_geometry_transform(lookup: Dict[str, "ParsedRoom"], canvas_size: int =
         "canvas_height": float(canvas_height),
     }
 
-
-def world_to_canvas(x: float, y: float, transform: Dict[str, float]) -> Tuple[float, float]:
-    scale = transform["scale"]
-    cx = (x - transform["min_x"]) * scale + transform["offset_x"]
-    # Invert Y so north is up when rendered on the canvas (origin top-left)
-    cy = (transform["max_y"] - y) * scale + transform["offset_y"]
-    return cx, cy
-
-
-def canvas_to_world(cx: float, cy: float, transform: Dict[str, float]) -> Tuple[float, float]:
-    scale = transform["scale"]
-    x = (cx - transform["offset_x"]) / scale + transform["min_x"]
-    y = transform["max_y"] - ((cy - transform["offset_y"]) / scale)
-    return x, y
-
-
-def build_canvas_initial_drawing(lookup: Dict[str, "ParsedRoom"], transform: Dict[str, float]) -> Dict[str, Any]:
-    objects: List[Dict[str, Any]] = []
-    handles: List[Dict[str, Any]] = []
-    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
-    room_ids = sorted(lookup.keys())
-    for idx, room_id in enumerate(room_ids):
-        room = lookup[room_id]
-        rings = geometry_to_rings(room.geometry)
-        paths = geometry_to_paths(room.geometry)
-        if not rings and not paths:
-            continue
-        color = palette[idx % len(palette)]
-        for ring_index, ring in enumerate(rings):
-            raw_points: List[Tuple[float, float]] = []
-            for x, y in ring:
-                raw_points.append((x, y))
-            if not raw_points:
-                continue
-            # Fabric polygons expect unique vertices; skip the final closing point
-            if len(raw_points) > 1 and raw_points[0] == raw_points[-1]:
-                raw_points = raw_points[:-1]
-
-            polygon_points: List[Dict[str, float]] = []
-            canvas_vertices: List[Tuple[float, float]] = []
-            for x, y in raw_points:
-                cx, cy = world_to_canvas(x, y, transform)
-                polygon_points.append({"x": cx, "y": cy})
-                canvas_vertices.append((cx, cy))
-            if not polygon_points:
-                continue
-
-            objects.append(
-                {
-                    "type": "polygon",
-                    "fill": "rgba(0,0,0,0)",
-                    "stroke": color,
-                    "strokeWidth": 2,
-                    "points": polygon_points,
-                    "data": {"room_id": room_id, "ring_index": ring_index, "kind": "polygon", "shape": "polygon"},
-                    "selectable": False,
-                    "evented": False,
-                    "hoverCursor": "default",
-                }
-            )
-
-            for vertex_index, (cx, cy) in enumerate(canvas_vertices):
-                handles.append(
-                    {
-                        "type": "circle",
-                        "radius": 6,
-                        "fill": color,
-                        "stroke": "#ffffff",
-                        "strokeWidth": 2,
-                        "left": cx,
-                        "top": cy,
-                        "originX": "center",
-                        "originY": "center",
-                        "opacity": 0.9,
-                        "selectable": True,
-                        "hasBorders": False,
-                        "hasControls": False,
-                        "lockScalingX": True,
-                        "lockScalingY": True,
-                        "lockRotation": True,
-                        "hoverCursor": "move",
-                        "data": {
-                            "room_id": room_id,
-                            "ring_index": ring_index,
-                            "vertex_index": vertex_index,
-                            "vertex_count": len(canvas_vertices),
-                            "kind": "vertex",
-                            "shape": "polygon",
-                        },
-                    }
-                )
-        for path_index, path in enumerate(paths):
-            raw_points: List[Tuple[float, float]] = []
-            for x, y in path:
-                raw_points.append((x, y))
-            if len(raw_points) < 2:
-                continue
-
-            polyline_points: List[Dict[str, float]] = []
-            canvas_vertices: List[Tuple[float, float]] = []
-            for x, y in raw_points:
-                cx, cy = world_to_canvas(x, y, transform)
-                polyline_points.append({"x": cx, "y": cy})
-                canvas_vertices.append((cx, cy))
-            objects.append(
-                {
-                    "type": "polyline",
-                    "points": polyline_points,
-                    "stroke": color,
-                    "fill": None,
-                    "strokeWidth": 2,
-                    "data": {"room_id": room_id, "path_index": path_index, "kind": "polyline", "shape": "polyline"},
-                    "selectable": False,
-                    "evented": False,
-                    "hoverCursor": "default",
-                }
-            )
-            for vertex_index, (cx, cy) in enumerate(canvas_vertices):
-                handles.append(
-                    {
-                        "type": "circle",
-                        "radius": 6,
-                        "fill": color,
-                        "stroke": "#ffffff",
-                        "strokeWidth": 2,
-                        "left": cx,
-                        "top": cy,
-                        "originX": "center",
-                        "originY": "center",
-                        "opacity": 0.9,
-                        "selectable": True,
-                        "hasBorders": False,
-                        "hasControls": False,
-                        "lockScalingX": True,
-                        "lockScalingY": True,
-                        "lockRotation": True,
-                        "hoverCursor": "move",
-                        "data": {
-                            "room_id": room_id,
-                            "path_index": path_index,
-                            "vertex_index": vertex_index,
-                            "vertex_count": len(canvas_vertices),
-                            "kind": "vertex",
-                            "shape": "polyline",
-                        },
-                    }
-                )
-    return {"objects": objects + handles}
-
-
-def canvas_object_to_ring(obj: Dict[str, Any], transform: Dict[str, float]) -> Optional[List[List[float]]]:
-    if obj.get("type") != "polygon":
-        return None
-    points = obj.get("points")
-    if (not isinstance(points, list) or not points) and isinstance(obj.get("path"), list):
-        extracted: List[Dict[str, float]] = []
-        for command in obj.get("path"):
-            if (
-                isinstance(command, list)
-                and len(command) >= 3
-                and command[0] in {"M", "L"}
-                and isinstance(command[1], (int, float))
-                and isinstance(command[2], (int, float))
-            ):
-                extracted.append({"x": float(command[1]), "y": float(command[2])})
-        points = extracted
-    if not isinstance(points, list) or not points:
-        return None
-    ring: List[List[float]] = []
-    for point in points:
-        if not isinstance(point, dict):
-            continue
-        px = point.get("x")
-        py = point.get("y")
-        if isinstance(px, (int, float)) and isinstance(py, (int, float)):
-            x, y = canvas_to_world(float(px), float(py), transform)
-            ring.append([x, y])
-    if len(ring) < 3:
-        return None
-    # Ensure polygon is closed
-    if ring[0] != ring[-1]:
-        ring.append(ring[0])
-    return ring
-
-
-def canvas_object_to_path(obj: Dict[str, Any], transform: Dict[str, float]) -> Optional[List[List[float]]]:
-    if obj.get("type") not in {"polyline", "line"}:
-        return None
-    points = obj.get("points")
-    if (not isinstance(points, list) or not points) and isinstance(obj.get("path"), list):
-        extracted: List[Dict[str, float]] = []
-        for command in obj.get("path"):
-            if (
-                isinstance(command, list)
-                and len(command) >= 3
-                and command[0] in {"M", "L"}
-                and isinstance(command[1], (int, float))
-                and isinstance(command[2], (int, float))
-            ):
-                extracted.append({"x": float(command[1]), "y": float(command[2])})
-        points = extracted
-    if not isinstance(points, list) or len(points) < 2:
-        return None
-    path: List[List[float]] = []
-    for point in points:
-        if not isinstance(point, dict):
-            continue
-        px = point.get("x")
-        py = point.get("y")
-        if isinstance(px, (int, float)) and isinstance(py, (int, float)):
-            x, y = canvas_to_world(float(px), float(py), transform)
-            path.append([x, y])
-    if len(path) < 2:
-        return None
-    return path
-
-
-# Helpers -----------------------------------------------------------------
-
-
-def _coerce_non_negative_int(value: Any) -> Optional[int]:
-    """Return a non-negative integer if ``value`` encodes one."""
-
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, Number):
-        if math.isfinite(float(value)):
-            as_int = int(round(float(value)))
-            if as_int >= 0 and abs(float(value) - as_int) < 1e-9:
-                return as_int
-    return None
-
-
-def update_geometries_from_canvas(
-    data: Dict[str, Any],
-    lookup: Dict[str, "ParsedRoom"],
-    transform: Dict[str, float],
-) -> Optional[Dict[str, Any]]:
-    if not data:
-        return None
-    objects = data.get("objects")
-    if not isinstance(objects, list):
-        return None
-    updated_polygons: Dict[str, List[List[List[float]]]] = {}
-    updated_polylines: Dict[str, List[List[List[float]]]] = {}
-    handled_components: Set[Tuple[str, str, int]] = set()
-
-    previous_positions: Dict[Tuple[str, str, int, int], Tuple[float, float]] = {}
-    for room_id, room in lookup.items():
-        rings = geometry_to_rings(room.geometry)
-        for ring_index, ring in enumerate(rings):
-            if len(ring) > 1 and ring[0] == ring[-1]:
-                ring_iter = ring[:-1]
-            else:
-                ring_iter = ring
-            for vertex_index, (x, y) in enumerate(ring_iter):
-                previous_positions[("polygon", room_id, ring_index, vertex_index)] = (x, y)
-        paths = geometry_to_paths(room.geometry)
-        for path_index, path in enumerate(paths):
-            for vertex_index, (x, y) in enumerate(path):
-                previous_positions[("polyline", room_id, path_index, vertex_index)] = (x, y)
-
-    vertex_positions: Dict[Tuple[str, str, int], Dict[int, Tuple[float, float]]] = {}
-    vertex_counts: Dict[Tuple[str, str, int], int] = {}
-    movement_info: Optional[Dict[str, Any]] = None
-
-    for obj in objects:
-        if not isinstance(obj, dict):
-            continue
-        payload = obj.get("data")
-        if not isinstance(payload, dict):
-            continue
-        room_id = payload.get("room_id")
-        if not room_id or room_id not in lookup:
-            continue
-        kind = payload.get("kind")
-        shape = payload.get("shape", "polygon")
-        if kind == "vertex":
-            if shape == "polyline":
-                component_index = _coerce_non_negative_int(payload.get("path_index"))
-            else:
-                component_index = _coerce_non_negative_int(payload.get("ring_index"))
-            vertex_index = _coerce_non_negative_int(payload.get("vertex_index"))
-            vertex_count = _coerce_non_negative_int(payload.get("vertex_count"))
-            if component_index is None or vertex_index is None:
-                continue
-            center_x = obj.get("left")
-            center_y = obj.get("top")
-            if not isinstance(center_x, (int, float)) or not isinstance(center_y, (int, float)):
-                continue
-            cx = float(center_x)
-            cy = float(center_y)
-            x, y = canvas_to_world(cx, cy, transform)
-            key = (shape, room_id, component_index)
-            vertex_positions.setdefault(key, {})[vertex_index] = (x, y)
-            if vertex_count is not None:
-                vertex_counts[key] = vertex_count
-        elif kind == "polygon":
-            ring = canvas_object_to_ring(obj, transform)
-            if not ring:
-                continue
-            ring_index = _coerce_non_negative_int(payload.get("ring_index"))
-            if ring_index is not None:
-                key = ("polygon", room_id, ring_index)
-                if key in handled_components:
-                    continue
-                handled_components.add(key)
-            updated_polygons.setdefault(room_id, []).append(ring)
-        elif kind == "polyline":
-            path = canvas_object_to_path(obj, transform)
-            if not path:
-                continue
-            path_index = _coerce_non_negative_int(payload.get("path_index"))
-            if path_index is not None:
-                key = ("polyline", room_id, path_index)
-                if key in handled_components:
-                    continue
-                handled_components.add(key)
-            updated_polylines.setdefault(room_id, []).append(path)
-
-    for key, vertices in vertex_positions.items():
-        shape, room_id, component_index = key
-        count = vertex_counts.get(key, len(vertices))
-        ordered: List[List[float]] = []
-        for vertex_idx in range(count):
-            if vertex_idx not in vertices:
-                prev = previous_positions.get((shape, room_id, component_index, vertex_idx))
-                if prev:
-                    ordered.append([prev[0], prev[1]])
-                continue
-            x, y = vertices[vertex_idx]
-            ordered.append([x, y])
-            prev = previous_positions.get((shape, room_id, component_index, vertex_idx))
-            if prev and (abs(prev[0] - x) > 1e-9 or abs(prev[1] - y) > 1e-9):
-                canvas_x, canvas_y = world_to_canvas(x, y, transform)
-                prev_canvas_x, prev_canvas_y = world_to_canvas(prev[0], prev[1], transform)
-                movement_info = {
-                    "room_id": room_id,
-                    "ring_index": component_index,
-                    "vertex_index": vertex_idx,
-                    "shape": shape,
-                    "from": {"x": prev[0], "y": prev[1], "cx": prev_canvas_x, "cy": prev_canvas_y},
-                    "to": {"x": x, "y": y, "cx": canvas_x, "cy": canvas_y},
-                    "delta": {"x": x - prev[0], "y": y - prev[1], "cx": canvas_x - prev_canvas_x, "cy": canvas_y - prev_canvas_y},
-                }
-        if shape == "polygon":
-            if len(ordered) < 3:
-                continue
-            if ordered[0] != ordered[-1]:
-                ordered.append(ordered[0])
-            updated_polygons.setdefault(room_id, []).append(ordered)
-            handled_components.add(key)
-        else:
-            if len(ordered) < 2:
-                continue
-            updated_polylines.setdefault(room_id, []).append(ordered)
-            handled_components.add(key)
-
-    for room_id, rings in updated_polygons.items():
-        if not rings:
-            continue
-        geometry: Dict[str, Any]
-        if len(rings) == 1:
-            geometry = {"type": "Polygon", "coordinates": [rings[0]]}
-        else:
-            geometry = {"type": "MultiPolygon", "coordinates": [[ring] for ring in rings]}
-        lookup[room_id].geometry = geometry
-
-    for room_id, paths in updated_polylines.items():
-        if not paths:
-            continue
-        geometry: Dict[str, Any]
-        if len(paths) == 1:
-            geometry = {"type": "LineString", "coordinates": paths[0]}
-        else:
-            geometry = {"type": "MultiLineString", "coordinates": paths}
-        lookup[room_id].geometry = geometry
-    return movement_info
 
 def parse_rooms(payload: Any) -> Tuple[List[ParsedRoom], str]:
     if is_geojson_payload(payload):
@@ -1165,53 +993,69 @@ if transform:
         st.info("No wall geometries available to preview.")
     st.subheader("Floorplan geometry editor")
     st.caption(
-        "Use the circular handles at polygon corners to drag vertices to new positions. "
-        "The most recent movement displays the delta and absolute coordinates below."
+        "This editor mirrors the wall preview with thin black lines. Click a wall segment to "
+        "select it, then use the button below to delete it."
     )
-    initial_drawing = build_canvas_initial_drawing(st.session_state.room_lookup, transform)
-    canvas_result = st_canvas(
-        fill_color="rgba(0, 0, 0, 0)",
-        stroke_width=2,
-        background_color="#f8f9fa",
-        width=int(transform["canvas_width"]),
-        height=int(transform["canvas_height"]),
-        drawing_mode="transform",
-        initial_drawing=initial_drawing,
-        display_toolbar=True,
-        update_streamlit=True,
-        key="floorplan_canvas",
-    )
-    if canvas_result.json_data:
-        movement = update_geometries_from_canvas(canvas_result.json_data, st.session_state.room_lookup, transform)
-        if movement:
-            st.session_state.last_vertex_move = movement
-        # Recompute transform for the next rerun to keep the canvas centered
-        st.session_state.geometry_transform = build_geometry_transform(st.session_state.room_lookup)
-    if st.session_state.last_vertex_move:
-        move = st.session_state.last_vertex_move
-        room_id = move.get("room_id", "?")
-        vertex_index = move.get("vertex_index", 0) + 1
-        shape_kind = move.get("shape", "polygon")
-        delta = move.get("delta", {})
-        target = move.get("to", {})
-        delta_world_x = float(delta.get("x", 0.0))
-        delta_world_y = float(delta.get("y", 0.0))
-        delta_canvas_x = float(delta.get("cx", 0.0))
-        delta_canvas_y = float(delta.get("cy", 0.0))
-        target_world_x = float(target.get("x", 0.0))
-        target_world_y = float(target.get("y", 0.0))
-        target_canvas_x = float(target.get("cx", 0.0))
-        target_canvas_y = float(target.get("cy", 0.0))
-        if shape_kind == "polyline":
-            shape_label = "line node"
-        else:
-            shape_label = "vertex"
-        st.info(
-            f"Room `{room_id}` {shape_label} {vertex_index}: Δx={delta_world_x:.2f}, Δy={delta_world_y:.2f} "
-            f"(world) → x={target_world_x:.2f}, y={target_world_y:.2f}. "
-            f"Canvas shift Δx={delta_canvas_x:.1f}px, Δy={delta_canvas_y:.1f}px → "
-            f"x={target_canvas_x:.1f}px, y={target_canvas_y:.1f}px."
+    if st.session_state.geometry_editor_message:
+        st.success(st.session_state.geometry_editor_message)
+        st.session_state.geometry_editor_message = ""
+
+    segments = collect_wall_segments(st.session_state.room_lookup)
+    selected_segment_id = st.session_state.selected_wall_segment
+    if selected_segment_id and selected_segment_id not in segments:
+        selected_segment_id = None
+        st.session_state.selected_wall_segment = None
+
+    if not segments:
+        st.info("No wall segments available for editing.")
+    else:
+        editor_fig = build_wall_editor_figure(segments, transform, selected_segment_id)
+        events = plotly_events(
+            editor_fig,
+            click_event=True,
+            hover_event=False,
+            select_event=False,
+            override_height=int(transform.get("canvas_height", 600)),
+            key="wall_editor_events",
         )
+        if events:
+            last_event = events[-1]
+            payload = last_event.get("customdata")
+            if isinstance(payload, list) and payload:
+                payload = payload[0]
+            if isinstance(payload, str) and payload in segments:
+                st.session_state.selected_wall_segment = payload
+                selected_segment_id = payload
+        # Rebuild the figure to show the active selection highlight
+        editor_fig = build_wall_editor_figure(segments, transform, selected_segment_id)
+        st.plotly_chart(editor_fig, use_container_width=True)
+
+        selected_segment = (
+            segments.get(st.session_state.selected_wall_segment)
+            if st.session_state.selected_wall_segment
+            else None
+        )
+        if selected_segment:
+            st.caption(
+                f"Selected wall in room `{selected_segment.room_id}` "
+                f"({selected_segment.shape} #{selected_segment.component_index + 1}, "
+                f"vertices {selected_segment.start_vertex + 1}→{selected_segment.end_vertex + 1})."
+            )
+        else:
+            st.caption("Click a segment above to select it for deletion.")
+
+        if st.button("Delete selected wall segment", disabled=selected_segment is None):
+            if selected_segment and delete_wall_segment(selected_segment, st.session_state.room_lookup):
+                st.session_state.geometry_editor_message = (
+                    f"Removed wall segment from room `{selected_segment.room_id}`."
+                )
+                st.session_state.selected_wall_segment = None
+                st.session_state.geometry_transform = build_geometry_transform(
+                    st.session_state.room_lookup
+                )
+                st.experimental_rerun()
+            else:
+                st.warning("Unable to delete the selected wall segment.")
     geojson_bytes = json.dumps(room_lookup_to_geojson(st.session_state.room_lookup), indent=2).encode("utf-8")
     st.download_button(
         "Download edited floorplan (GeoJSON)",
