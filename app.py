@@ -1076,7 +1076,6 @@ if transform:
             select_event=False,
             override_height=int(transform.get("canvas_height", 600)),
             key="wall_editor_events",
-            config={"scrollZoom": True},
         )
         if events:
             last_event = events[-1]
