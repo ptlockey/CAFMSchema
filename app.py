@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, UnidentifiedImageError
 from streamlit_drawable_canvas import st_canvas
@@ -302,6 +303,86 @@ def geometry_to_paths(geometry: Any) -> List[List[List[float]]]:
         path = normalize_polyline(list(geometry))
         return [path] if path else []
     return []
+
+
+def build_wall_preview_figure(
+    lookup: Dict[str, "ParsedRoom"],
+    transform: Dict[str, float],
+    wall_width: float,
+) -> Optional[go.Figure]:
+    """Return a Plotly figure showing polygon edges and polylines as walls."""
+
+    xs: List[Optional[float]] = []
+    ys: List[Optional[float]] = []
+
+    for room in lookup.values():
+        for ring in geometry_to_rings(room.geometry):
+            if len(ring) < 2:
+                continue
+            pairs = list(zip(ring, ring[1:]))
+            if ring[0] != ring[-1]:
+                pairs.append((ring[-1], ring[0]))
+            for (x1, y1), (x2, y2) in pairs:
+                if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                    continue
+                xs.extend([float(x1), float(x2), None])
+                ys.extend([float(y1), float(y2), None])
+        for path in geometry_to_paths(room.geometry):
+            if len(path) < 2:
+                continue
+            for (x1, y1), (x2, y2) in zip(path, path[1:]):
+                if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                    continue
+                xs.extend([float(x1), float(x2), None])
+                ys.extend([float(y1), float(y2), None])
+
+    if not xs or not ys:
+        return None
+
+    fig = go.Figure(
+        data=[
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(color="#000000", width=wall_width),
+                hoverinfo="skip",
+            )
+        ]
+    )
+
+    min_x = transform["min_x"]
+    max_x = transform["max_x"]
+    min_y = transform["min_y"]
+    max_y = transform["max_y"]
+
+    fig.update_xaxes(
+        range=[min_x, max_x],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        title_text="",
+        constrain="domain",
+    )
+    fig.update_yaxes(
+        range=[max_y, min_y],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        title_text="",
+        scaleanchor="x",
+        scaleratio=1,
+    )
+
+    height = int(max(transform.get("canvas_height", 0), 300))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="#ffffff",
+        margin=dict(l=20, r=20, t=20, b=20),
+        height=height,
+    )
+
+    return fig
 
 
 def iter_geometry_points(lookup: Dict[str, "ParsedRoom"]) -> Iterable[Tuple[float, float]]:
@@ -1067,6 +1148,21 @@ if st.session_state.rooms_df is None or st.session_state.rooms_df.empty:
 transform = build_geometry_transform(st.session_state.room_lookup)
 if transform:
     st.session_state.geometry_transform = transform
+    st.subheader("Floorplan wall preview")
+    wall_thickness = st.slider(
+        "Wall thickness",
+        min_value=1,
+        max_value=20,
+        value=3,
+        step=1,
+        key="wall_thickness_slider",
+        help="Adjust how thick the wall lines appear in the preview.",
+    )
+    wall_fig = build_wall_preview_figure(st.session_state.room_lookup, transform, wall_thickness)
+    if wall_fig:
+        st.plotly_chart(wall_fig, use_container_width=True)
+    else:
+        st.info("No wall geometries available to preview.")
     st.subheader("Floorplan geometry editor")
     st.caption(
         "Use the circular handles at polygon corners to drag vertices to new positions. "
