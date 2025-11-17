@@ -353,6 +353,7 @@ def build_wall_preview_figure(
 ) -> Optional[go.Figure]:
     """Return a Plotly figure showing polygon edges and polylines as walls."""
 
+    polygon_traces: List[go.Scatter] = []
     xs: List[Optional[float]] = []
     ys: List[Optional[float]] = []
 
@@ -368,6 +369,26 @@ def build_wall_preview_figure(
                     continue
                 xs.extend([float(x1), float(x2), None])
                 ys.extend([float(y1), float(y2), None])
+
+            points = _collect_ring_points(ring)
+            if len(points) >= 3:
+                pxs, pys = zip(*points)
+                px_list = list(pxs)
+                py_list = list(pys)
+                px_list.append(px_list[0])
+                py_list.append(py_list[0])
+                polygon_traces.append(
+                    go.Scatter(
+                        x=px_list,
+                        y=py_list,
+                        mode="lines",
+                        fill="toself",
+                        fillcolor="rgba(52, 152, 219, 0.5)",
+                        line=dict(color="rgba(52, 152, 219, 0.8)", width=1),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
         for path in geometry_to_paths(room.geometry):
             if len(path) < 2:
                 continue
@@ -377,11 +398,12 @@ def build_wall_preview_figure(
                 xs.extend([float(x1), float(x2), None])
                 ys.extend([float(y1), float(y2), None])
 
-    if not xs or not ys:
+    if not polygon_traces and (not xs or not ys):
         return None
 
-    fig = go.Figure(
-        data=[
+    data: List[go.Scatter] = list(polygon_traces)
+    if xs and ys:
+        data.append(
             go.Scatter(
                 x=xs,
                 y=ys,
@@ -389,8 +411,9 @@ def build_wall_preview_figure(
                 line=dict(color="#000000", width=wall_width),
                 hoverinfo="skip",
             )
-        ]
-    )
+        )
+
+    fig = go.Figure(data=data)
 
     x_range, y_range = compute_zoomed_axis_ranges(transform, zoom_factor)
 
