@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -60,6 +60,8 @@ def init_state() -> None:
     st.session_state.setdefault("geometry_editor_message", "")
     st.session_state.setdefault("wall_editor_tool", "Select walls")
     st.session_state.setdefault("wall_editor_zoom", 100)
+    st.session_state.setdefault("filter_remove_smallest", 0)
+    st.session_state.setdefault("filter_remove_largest", 0)
 
 
 init_state()
@@ -463,6 +465,51 @@ def _collect_ring_points(ring: List[List[float]]) -> List[Tuple[float, float]]:
     if points[0] == points[-1]:
         points = points[:-1]
     return points
+
+
+def polygon_ring_area(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    total = len(points)
+    for idx in range(total):
+        x1, y1 = points[idx]
+        x2, y2 = points[(idx + 1) % total]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def polygon_geometry_area(geometry: Any) -> float:
+    total_area = 0.0
+    for ring in geometry_to_rings(geometry):
+        points = _collect_ring_points(ring)
+        total_area += polygon_ring_area(points)
+    return total_area
+
+
+def filter_rooms_by_polygon_size(
+    lookup: Dict[str, "ParsedRoom"], remove_smallest: int, remove_largest: int
+) -> Tuple[Dict[str, "ParsedRoom"], Set[str], List[Tuple[str, float]]]:
+    polygon_areas: List[Tuple[str, float]] = []
+    for room_id, room in lookup.items():
+        area = polygon_geometry_area(room.geometry)
+        if area > 0:
+            polygon_areas.append((room_id, area))
+    polygon_areas.sort(key=lambda item: item[1])
+
+    total_polygons = len(polygon_areas)
+    remove_smallest = min(max(remove_smallest, 0), total_polygons)
+    remaining_after_smallest = max(total_polygons - remove_smallest, 0)
+    remove_largest = min(max(remove_largest, 0), remaining_after_smallest)
+
+    removed_ids = set()
+    if remove_smallest:
+        removed_ids.update(room_id for room_id, _ in polygon_areas[:remove_smallest])
+    if remove_largest:
+        removed_ids.update(room_id for room_id, _ in polygon_areas[-remove_largest:])
+
+    filtered_lookup = {k: v for k, v in lookup.items() if k not in removed_ids}
+    return filtered_lookup, removed_ids, polygon_areas
 
 
 def collect_wall_segments(lookup: Dict[str, "ParsedRoom"]) -> Dict[str, WallSegment]:
@@ -1021,7 +1068,65 @@ if st.session_state.floorplan_image_bytes is not None:
 if st.session_state.rooms_df is None or st.session_state.rooms_df.empty:
     st.stop()
 
-transform = build_geometry_transform(st.session_state.room_lookup)
+filtered_lookup = st.session_state.room_lookup
+
+polygon_area_info: List[Tuple[str, float]] = []
+for room_id, room in st.session_state.room_lookup.items():
+    area = polygon_geometry_area(room.geometry)
+    if area > 0:
+        polygon_area_info.append((room_id, area))
+
+if polygon_area_info:
+    max_polygons = len(polygon_area_info)
+    st.session_state.filter_remove_smallest = min(
+        st.session_state.filter_remove_smallest, max_polygons
+    )
+    remaining_after_smallest = max(
+        max_polygons - st.session_state.filter_remove_smallest, 0
+    )
+    st.session_state.filter_remove_largest = min(
+        st.session_state.filter_remove_largest, remaining_after_smallest
+    )
+    with st.expander("Polygon size filters", expanded=False):
+        st.caption(
+            "Remove extremely small or large polygons from the preview and editor to reduce noise."
+        )
+        st.number_input(
+            "Ignore smallest polygons",
+            min_value=0,
+            max_value=max_polygons,
+            step=1,
+            key="filter_remove_smallest",
+        )
+        remaining_after_smallest = max(
+            max_polygons - st.session_state.filter_remove_smallest, 0
+        )
+        st.number_input(
+            "Ignore largest polygons",
+            min_value=0,
+            max_value=remaining_after_smallest,
+            step=1,
+            key="filter_remove_largest",
+            help="Large polygons often represent site outlines; remove them to focus on rooms.",
+        )
+        st.caption(
+            "Filtering only affects the wall preview and geometry editor. Rooms remain available "
+            "in the table and downloads."
+        )
+
+    filtered_lookup, removed_ids, _ = filter_rooms_by_polygon_size(
+        st.session_state.room_lookup,
+        st.session_state.filter_remove_smallest,
+        st.session_state.filter_remove_largest,
+    )
+    if removed_ids:
+        st.info(
+            f"Filtered {len(removed_ids)} polygon(s) from the view based on size settings."
+        )
+else:
+    st.caption("No polygon geometries detected for size-based filtering.")
+
+transform = build_geometry_transform(filtered_lookup)
 if transform:
     st.session_state.geometry_transform = transform
     st.subheader("Floorplan wall preview")
@@ -1045,7 +1150,7 @@ if transform:
     )
     zoom_factor = zoom_percent / 100.0
     wall_fig = build_wall_preview_figure(
-        st.session_state.room_lookup,
+        filtered_lookup,
         transform,
         wall_thickness,
         zoom_factor,
@@ -1076,7 +1181,7 @@ if transform:
         st.success(st.session_state.geometry_editor_message)
         st.session_state.geometry_editor_message = ""
 
-    segments = collect_wall_segments(st.session_state.room_lookup)
+    segments = collect_wall_segments(filtered_lookup)
     selected_segment_id = st.session_state.selected_wall_segment
     if selected_segment_id and selected_segment_id not in segments:
         selected_segment_id = None
