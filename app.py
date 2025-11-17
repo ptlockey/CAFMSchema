@@ -392,8 +392,6 @@ def build_wall_preview_figure(
                         x=px_list,
                         y=py_list,
                         mode="lines",
-                        fill="toself" if room_label else None,
-                        fillcolor="rgba(52, 152, 219, 0.5)" if room_label else None,
                         line=dict(color="rgba(52, 152, 219, 0.8)", width=1),
                         hoverinfo="skip",
                         showlegend=False,
