@@ -356,10 +356,15 @@ def build_wall_preview_figure(
     """Return a Plotly figure showing polygon edges and polylines as walls."""
 
     polygon_traces: List[go.Scatter] = []
+    label_xs: List[float] = []
+    label_ys: List[float] = []
+    label_texts: List[str] = []
     xs: List[Optional[float]] = []
     ys: List[Optional[float]] = []
 
     for room in lookup.values():
+        room_label = room.source_name.strip() if room.source_name else ""
+        largest_ring_points: List[Tuple[float, float]] = []
         for ring in geometry_to_rings(room.geometry):
             if len(ring) < 2:
                 continue
@@ -374,6 +379,9 @@ def build_wall_preview_figure(
 
             points = _collect_ring_points(ring)
             if len(points) >= 3:
+                area = polygon_ring_area(points)
+                if area > polygon_ring_area(largest_ring_points):
+                    largest_ring_points = points
                 pxs, pys = zip(*points)
                 px_list = list(pxs)
                 py_list = list(pys)
@@ -384,13 +392,20 @@ def build_wall_preview_figure(
                         x=px_list,
                         y=py_list,
                         mode="lines",
-                        fill="toself",
-                        fillcolor="rgba(52, 152, 219, 0.5)",
+                        fill="toself" if room_label else None,
+                        fillcolor="rgba(52, 152, 219, 0.5)" if room_label else None,
                         line=dict(color="rgba(52, 152, 219, 0.8)", width=1),
                         hoverinfo="skip",
                         showlegend=False,
                     )
                 )
+        if room_label and len(largest_ring_points) >= 3:
+            centroid = polygon_centroid(largest_ring_points)
+            if centroid:
+                cx, cy = centroid
+                label_xs.append(cx)
+                label_ys.append(cy)
+                label_texts.append(room_label)
         for path in geometry_to_paths(room.geometry):
             if len(path) < 2:
                 continue
@@ -404,6 +419,19 @@ def build_wall_preview_figure(
         return None
 
     data: List[go.Scatter] = list(polygon_traces)
+    if label_xs and label_ys and label_texts:
+        data.append(
+            go.Scatter(
+                x=label_xs,
+                y=label_ys,
+                mode="text",
+                text=label_texts,
+                textposition="middle center",
+                textfont=dict(color="#1f2d3d", size=12),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
     if xs and ys:
         data.append(
             go.Scatter(
@@ -477,6 +505,28 @@ def polygon_ring_area(points: List[Tuple[float, float]]) -> float:
         x2, y2 = points[(idx + 1) % total]
         area += x1 * y2 - x2 * y1
     return abs(area) / 2.0
+
+
+def polygon_centroid(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+    if len(points) < 3:
+        return None
+    twice_area = 0.0
+    cx = 0.0
+    cy = 0.0
+    total = len(points)
+    for idx in range(total):
+        x0, y0 = points[idx]
+        x1, y1 = points[(idx + 1) % total]
+        cross = x0 * y1 - x1 * y0
+        twice_area += cross
+        cx += (x0 + x1) * cross
+        cy += (y0 + y1) * cross
+    if abs(twice_area) < 1e-9:
+        avg_x = sum(x for x, _ in points) / total
+        avg_y = sum(y for _, y in points) / total
+        return avg_x, avg_y
+    factor = 1 / (3 * twice_area)
+    return cx * factor, cy * factor
 
 
 def polygon_geometry_area(geometry: Any) -> float:
